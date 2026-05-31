@@ -89,7 +89,10 @@ def _take_n(stream: Any, tok: Any, n: int,
 
     for row in stream:
         scanned += 1
-        text = formatter(row)
+        try:
+            text = formatter(row)
+        except (KeyError, TypeError, AttributeError):
+            text = ""
         if text and _tok_len(text, tok) <= MAX_TOKENS:
             out.append({"text": text})
             kept += 1
@@ -158,30 +161,36 @@ def _fmt_messages(row: Dict[str, Any]) -> str:
 
 # ── Stage-2 formatters ────────────────────────────────────────────
 
-def _fmt_code_sft(row: Dict[str, Any]) -> str:
-    """Safe formatter for SFT coding datasets with varied column names."""
-    # Try messages format first
-    messages = row.get("messages", [])
-    if messages:
-        parts = []
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role and content:
-                parts.append(f"{role}: {content}")
-        text = "\n".join(parts)
-        if text:
-            return text
+def _fmt_stable_code(row: Dict[str, Any]) -> str:
+    """Formatter for bunyaminergen/Stable-Code-Python-SFT."""
+    instr = row.get("instruction", "")
+    if isinstance(instr, list):
+        instr = " ".join(
+            m.get("content", str(m)) if isinstance(m, dict) else str(m)
+            for m in instr
+        )
+    code = row.get("output", "")
+    if not instr or not code:
+        return ""
+    return f"Instruction: {instr}\nCode: {code}"
 
-    # Try instruction/prompt + output/code/solution
-    instr = (row.get("instruction", "") or row.get("prompt", "") or
-             row.get("question", "") or row.get("input", ""))
-    code = (row.get("output", "") or row.get("code", "") or
-            row.get("solution", "") or row.get("response", ""))
-    if instr and code:
-        return f"### Instruction\n{instr}\n### Code\n{code}"
 
-    return ""
+def _fmt_flytech(row: Dict[str, Any]) -> str:
+    """Formatter for flytech/python-codes-25k."""
+    instr = row.get("instruction", "")
+    code = row.get("output", "")
+    if not instr or not code:
+        return ""
+    return f"Instruction: {instr}\nCode: {code}"
+
+
+def _fmt_glaive(row: Dict[str, Any]) -> str:
+    """Formatter for glaiveai/glaive-code-assistant-v3."""
+    q = row.get("question", "")
+    a = row.get("answer", "")
+    if not q or not a:
+        return ""
+    return f"Question: {q}\nAnswer: {a}"
 
 
 def _fmt_musr(row: Dict[str, Any]) -> str:
@@ -277,23 +286,23 @@ def main() -> None:
 
     s2_all: List[Dict[str, str]] = []
 
-    # (a) Stable-Code-Python-SFT — 300 code generation examples
-    print("  [2a] bunyaminergen/Stable-Code-Python-SFT  (target: 300)")
+    # (a) Stable-Code-Python-SFT — 400 code generation examples
+    print("  [2a] bunyaminergen/Stable-Code-Python-SFT  (target: 400)")
     ds_stable = _stream_dataset("bunyaminergen/Stable-Code-Python-SFT")
-    s2_all += _take_n(ds_stable, tok, 300, _fmt_code_sft,
+    s2_all += _take_n(ds_stable, tok, 400, _fmt_stable_code,
                       label="Stable-Code-Python-SFT")
 
-    # (a2) Qwen3-Coder-Next-Open-Code-SFT — 300 code generation examples
-    print("  [2a2] zake7749/Qwen3-Coder-Next-Open-Code-SFT  (target: 300)")
-    ds_qwen = _stream_dataset("zake7749/Qwen3-Coder-Next-Open-Code-SFT")
-    s2_all += _take_n(ds_qwen, tok, 300, _fmt_code_sft,
-                      label="Qwen3-Coder-Next-Open-Code-SFT")
+    # (a2) flytech/python-codes-25k — 200 code generation examples
+    print("  [2a2] flytech/python-codes-25k  (target: 200)")
+    ds_flytech = _stream_dataset("flytech/python-codes-25k")
+    s2_all += _take_n(ds_flytech, tok, 200, _fmt_flytech,
+                      label="python-codes-25k")
 
-    # (a3) Code-Reasoning — 150 code + reasoning examples
-    print("  [2a3] GetSoloTech/Code-Reasoning  (target: 150)")
-    ds_reason = _stream_dataset("GetSoloTech/Code-Reasoning")
-    s2_all += _take_n(ds_reason, tok, 150, _fmt_code_sft,
-                      label="Code-Reasoning")
+    # (a3) glaive-code-assistant-v3 — 150 code Q&A examples
+    print("  [2a3] glaiveai/glaive-code-assistant-v3  (target: 150)")
+    ds_glaive = _stream_dataset("glaiveai/glaive-code-assistant-v3")
+    s2_all += _take_n(ds_glaive, tok, 150, _fmt_glaive,
+                      label="glaive-code-assistant-v3")
 
     # (b) MuSR — 750 multi-step reasoning
     print("  [2b] TAUR-Lab/MuSR  (target: 750)")
