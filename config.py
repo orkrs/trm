@@ -97,6 +97,7 @@ class TrainingConfig:
     truncation_length: int = 2048
     gradient_clip: float = 1.0
     num_epochs: int = 3
+    max_steps: int = -1
     gradient_accumulation_steps: int = 4
     log_every_n_steps: int = 10
     eval_every_n_steps: int = 500

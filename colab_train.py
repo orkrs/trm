@@ -1,14 +1,9 @@
 """colab_train.py — TRM-Bank v3.0 training entry point for Google Colab (T4, 16 GB).
 
 Usage:
-    # 1. Prepare datasets first:
-    python prepare_datasets.py
-
-    # 2. Verify dependencies:
-    python verify_modules.py
-
-    # 3. Launch training:
-    python colab_train.py
+    python prepare_datasets.py   # 1. prepare data
+    python verify_modules.py     # 2. verify providers
+    python colab_train.py        # 3. train
 
 The script downloads Mamba-2.8B in 4-bit NF4, patches all SSM mixers
 with ComplexMIMOMamba3, applies QRandLoRA (r=64), attaches the LPRM
@@ -28,22 +23,30 @@ from loguru import logger
 
 
 # ------------------------------------------------------------------
-# Config overrides for Colab (T4, 16 GB VRAM)
+# Colab T4 optimised config
 # ------------------------------------------------------------------
 
-COLAB_CONFIG_OVERRIDES: Dict[str, Any] = {
+STAGE1_OVERRIDES: Dict[str, Any] = {
     "batch_size": 2,
     "gradient_accumulation_steps": 8,
-    "truncation_length": 1024,
+    "truncation_length": 256,
     "learning_rate": 3e-4,
-    "warmup_steps": 50,
-    "num_epochs": 3,
+    "warmup_steps": 30,
+    "max_steps": 500,
+    "num_epochs": 999,
     "log_every_n_steps": 10,
-    "eval_every_n_steps": 500,
-    "save_every_n_steps": 1000,
+    "eval_every_n_steps": 250,
+    "save_every_n_steps": 250,
     "output_dir": "./outputs_colab",
-    "max_seq_length": 2048,
+    "max_seq_length": 1024,
     "lprm_weight": 0.1,
+}
+
+STAGE2_OVERRIDES: Dict[str, Any] = {
+    **STAGE1_OVERRIDES,
+    "learning_rate": 1e-4,
+    "max_steps": 300,
+    "warmup_steps": 20,
 }
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "processed")
@@ -62,16 +65,13 @@ def check_gpu() -> torch.device:
     return device
 
 
-def load_tokenized_sequences(jsonl_path: str, max_seq_length: int = 2048) -> List[torch.Tensor]:
-    """Load a .jsonl file and tokenize all texts with the Mamba tokenizer.
-
-    Each text is encoded (no truncation yet) and converted to a
-    torch.Tensor.  Sequences longer than ``max_seq_length`` are
-    split at that boundary (each chunk becomes a separate example).
+def load_tokenized_sequences(jsonl_path: str,
+                             max_seq_length: int = 1024) -> List[torch.Tensor]:
+    """Load a .jsonl file, tokenize, split into chunks.
 
     Args:
         jsonl_path: Path to the .jsonl file.
-        max_seq_length: Maximum token count per sequence.
+        max_seq_length: Maximum tokens per sequence chunk.
 
     Returns:
         List of 1-D token-id tensors.
@@ -100,7 +100,6 @@ def load_tokenized_sequences(jsonl_path: str, max_seq_length: int = 2048) -> Lis
             ids = tokenizer.encode(text, truncation=False)
             if len(ids) < 2:
                 continue
-            # Split long sequences into chunks.
             for start in range(0, len(ids), max_seq_length):
                 chunk = ids[start : start + max_seq_length]
                 if len(chunk) >= 2:
@@ -116,26 +115,13 @@ def build_trainer_for_stage(
     device: torch.device,
     config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """Build model, LPRM, memory, router, and trainer for one training stage.
-
-    Args:
-        stage_name: Human-readable stage label.
-        jsonl_path: Path to the preprocessed .jsonl dataset.
-        device: Target CUDA device.
-        config_overrides: Overrides for TrainingConfig.
-
-    Returns:
-        Initialized TRMBankTrainer instance.
-    """
-    from config import CONFIG, TrainingConfig
+    """Build model, LPRM, memory, router, and trainer for one stage."""
+    from config import CONFIG
     from core.complex_mimo_mamba import TRMBankModel
     from training.trainer import TruncatedBPTTDataset, TRMBankTrainer
 
     cfg = CONFIG.training
-
-    # Apply overrides if provided.
     if config_overrides:
-        # frozen dataclass -> we need a fresh instance
         from dataclasses import replace
         cfg = replace(cfg, **config_overrides)
 
@@ -145,7 +131,8 @@ def build_trainer_for_stage(
 
     # ---- 1. Load tokenized sequences ----
     print("\n[1/5] Loading dataset...")
-    sequences = load_tokenized_sequences(jsonl_path, max_seq_length=cfg.truncation_length)
+    sequences = load_tokenized_sequences(jsonl_path,
+                                         max_seq_length=cfg.truncation_length)
     if not sequences:
         raise RuntimeError(f"No sequences loaded from {jsonl_path}")
     train_dataset = TruncatedBPTTDataset(
@@ -225,7 +212,9 @@ def build_trainer_for_stage(
     print(f"  Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print(f"  Batch size: {cfg.batch_size}")
     print(f"  Gradient accumulation: {cfg.gradient_accumulation_steps}")
+    print(f"  Effective batch: {cfg.batch_size * cfg.gradient_accumulation_steps}")
     print(f"  Truncation length: {cfg.truncation_length}")
+    print(f"  Max steps: {cfg.max_steps}")
     print(f"  Output dir: {cfg.output_dir}")
 
     return trainer
@@ -233,13 +222,11 @@ def build_trainer_for_stage(
 
 def main() -> None:
     print("=" * 60)
-    print("TRM-Bank v3.0 — Colab Training")
+    print("TRM-Bank v3.0 — Colab Training (T4 optimised)")
     print("=" * 60)
 
-    # ---- GPU check ----
     device = check_gpu()
 
-    # ---- Verify datasets exist ----
     stage1_path = os.path.join(DATA_DIR, "stage1_qrandlora.jsonl")
     stage2_path = os.path.join(DATA_DIR, "stage2_router.jsonl")
     for p in (stage1_path, stage2_path):
@@ -248,38 +235,36 @@ def main() -> None:
             print("  Run `python prepare_datasets.py` first.")
             sys.exit(1)
 
-    # ---- Stage 1: QRandLoRA pretraining ----
+    # ---- Stage 1: QRandLoRA pretraining (500 steps) ----
     trainer1 = build_trainer_for_stage(
-        "Stage 1 — QRandLoRA Pretraining",
+        "Stage 1 — QRandLoRA Pretraining (500 steps)",
         stage1_path,
         device,
-        config_overrides=COLAB_CONFIG_OVERRIDES,
+        config_overrides=STAGE1_OVERRIDES,
     )
     print("\n[Training] Stage 1: QRandLoRA pretraining...")
-    history1 = trainer1.train(num_epochs=COLAB_CONFIG_OVERRIDES["num_epochs"])
+    history1 = trainer1.train(max_steps=STAGE1_OVERRIDES["max_steps"])
     final_loss1 = history1["train_loss"][-1] if history1["train_loss"] else float("nan")
     print(f"  Stage 1 complete. Final train loss: {final_loss1:.4f}")
 
-    # ---- Stage 2: Router + LPRM tuning ----
-    COLAB_CONFIG_OVERRIDES_STAGE2 = dict(COLAB_CONFIG_OVERRIDES)
-    COLAB_CONFIG_OVERRIDES_STAGE2["learning_rate"] = 1e-4  # lower LR for fine-tuning
+    # ---- Stage 2: Router + LPRM tuning (300 steps) ----
     trainer2 = build_trainer_for_stage(
-        "Stage 2 — Router + LPRM Tuning",
+        "Stage 2 — Router + LPRM Tuning (300 steps)",
         stage2_path,
         device,
-        config_overrides=COLAB_CONFIG_OVERRIDES_STAGE2,
+        config_overrides=STAGE2_OVERRIDES,
     )
     print("\n[Training] Stage 2: Router + LPRM tuning...")
-    history2 = trainer2.train(num_epochs=COLAB_CONFIG_OVERRIDES_STAGE2["num_epochs"])
+    history2 = trainer2.train(max_steps=STAGE2_OVERRIDES["max_steps"])
     final_loss2 = history2["train_loss"][-1] if history2["train_loss"] else float("nan")
     print(f"  Stage 2 complete. Final train loss: {final_loss2:.4f}")
 
     # ---- Summary ----
     print("\n" + "=" * 60)
     print("TRM-Bank v3.0 training complete.")
-    print(f"  Stage 1 (QRandLoRA) final loss: {final_loss1:.4f}")
-    print(f"  Stage 2 (Router+LPRM) final loss: {final_loss2:.4f}")
-    print(f"  Checkpoints: {COLAB_CONFIG_OVERRIDES['output_dir']}/")
+    print(f"  Stage 1 (QRandLoRA, 500 steps) loss: {final_loss1:.4f}")
+    print(f"  Stage 2 (Router+LPRM, 300 steps) loss: {final_loss2:.4f}")
+    print(f"  Checkpoints: {STAGE1_OVERRIDES['output_dir']}/")
     print("=" * 60)
 
 

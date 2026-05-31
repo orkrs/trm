@@ -158,12 +158,30 @@ def _fmt_messages(row: Dict[str, Any]) -> str:
 
 # ── Stage-2 formatters ────────────────────────────────────────────
 
-def _fmt_livecodebench(row: Dict[str, Any]) -> str:
-    q = row.get("question", row.get("prompt", row.get("problem", "")))
-    c = row.get("code", row.get("solution", row.get("output", "")))
-    if not q or not c:
-        return ""
-    return f"### Problem\n{q}\n### Code\n{c}"
+def _fmt_code_sft(row: Dict[str, Any]) -> str:
+    """Safe formatter for SFT coding datasets with varied column names."""
+    # Try messages format first
+    messages = row.get("messages", [])
+    if messages:
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role and content:
+                parts.append(f"{role}: {content}")
+        text = "\n".join(parts)
+        if text:
+            return text
+
+    # Try instruction/prompt + output/code/solution
+    instr = (row.get("instruction", "") or row.get("prompt", "") or
+             row.get("question", "") or row.get("input", ""))
+    code = (row.get("output", "") or row.get("code", "") or
+            row.get("solution", "") or row.get("response", ""))
+    if instr and code:
+        return f"### Instruction\n{instr}\n### Code\n{code}"
+
+    return ""
 
 
 def _fmt_musr(row: Dict[str, Any]) -> str:
@@ -259,11 +277,23 @@ def main() -> None:
 
     s2_all: List[Dict[str, str]] = []
 
-    # (a) LiveCodeBench — 750 code generation
-    print("  [2a] lighteval/code_generation_lite  (target: 750)")
-    ds_lcb = _stream_dataset("lighteval/code_generation_lite", split="test")
-    s2_all += _take_n(ds_lcb, tok, STAGE2_PER_SRC, _fmt_livecodebench,
-                      label="LiveCodeBench")
+    # (a) Stable-Code-Python-SFT — 300 code generation examples
+    print("  [2a] bunyaminergen/Stable-Code-Python-SFT  (target: 300)")
+    ds_stable = _stream_dataset("bunyaminergen/Stable-Code-Python-SFT")
+    s2_all += _take_n(ds_stable, tok, 300, _fmt_code_sft,
+                      label="Stable-Code-Python-SFT")
+
+    # (a2) Qwen3-Coder-Next-Open-Code-SFT — 300 code generation examples
+    print("  [2a2] zake7749/Qwen3-Coder-Next-Open-Code-SFT  (target: 300)")
+    ds_qwen = _stream_dataset("zake7749/Qwen3-Coder-Next-Open-Code-SFT")
+    s2_all += _take_n(ds_qwen, tok, 300, _fmt_code_sft,
+                      label="Qwen3-Coder-Next-Open-Code-SFT")
+
+    # (a3) Code-Reasoning — 150 code + reasoning examples
+    print("  [2a3] GetSoloTech/Code-Reasoning  (target: 150)")
+    ds_reason = _stream_dataset("GetSoloTech/Code-Reasoning")
+    s2_all += _take_n(ds_reason, tok, 150, _fmt_code_sft,
+                      label="Code-Reasoning")
 
     # (b) MuSR — 750 multi-step reasoning
     print("  [2b] TAUR-Lab/MuSR  (target: 750)")

@@ -267,7 +267,8 @@ class TRMBankTrainer:
         self.lprm.eval()
         return avg_loss
 
-    def train_epoch(self, epoch: int) -> Dict[str, float]:
+    def train_epoch(self, epoch: int,
+                    max_steps_remaining: int = -1) -> Dict[str, float]:
         """Run one training epoch with truncated BPTT.
 
         States are carried across segments of the same sequence
@@ -275,6 +276,8 @@ class TRMBankTrainer:
 
         Args:
             epoch: Current epoch number (for logging).
+            max_steps_remaining: If > 0, stop after this many optimizer
+                                 steps.  -1 means no limit.
 
         Returns:
             Dictionary of average metrics for the epoch.
@@ -348,6 +351,11 @@ class TRMBankTrainer:
                 self.scheduler.step()
                 self.optimizer.zero_grad()
                 self.global_step += 1
+
+                # Early stopping at max_steps.
+                if max_steps_remaining > 0 and self.global_step >= max_steps_remaining:
+                    logger.info(f"Reached max_steps={max_steps_remaining}, stopping early.")
+                    break
 
             # Logging.
             if self.global_step % self.config.log_every_n_steps == 0 and num_batches > 0:
@@ -461,16 +469,21 @@ class TRMBankTrainer:
             self.lprm.load_state_dict(state["lprm_state"])
         logger.info(f"Checkpoint loaded from {path} (step {self.global_step})")
 
-    def train(self, num_epochs: Optional[int] = None) -> Dict[str, List[float]]:
+    def train(self, num_epochs: Optional[int] = None,
+              max_steps: Optional[int] = None) -> Dict[str, List[float]]:
         """Run the full training loop.
 
         Args:
             num_epochs: Override for the configured number of epochs.
+            max_steps: Override for the configured max_steps.  When set,
+                       training stops after this many optimizer steps
+                       (across all epochs).
 
         Returns:
             Dictionary of training history.
         """
         n_epochs = num_epochs or self.config.num_epochs
+        total_max = max_steps if max_steps is not None else self.config.max_steps
         history: Dict[str, List[float]] = {
             "train_loss": [],
             "train_lprm_loss": [],
@@ -478,7 +491,15 @@ class TRMBankTrainer:
         }
 
         for epoch in range(1, n_epochs + 1):
-            train_metrics = self.train_epoch(epoch)
+            remaining = -1
+            if total_max > 0:
+                remaining = max(0, total_max - self.global_step)
+                if remaining <= 0:
+                    logger.info(f"max_steps={total_max} already reached.")
+                    break
+
+            train_metrics = self.train_epoch(epoch,
+                                             max_steps_remaining=remaining)
             history["train_loss"].append(train_metrics["loss"])
             history["train_lprm_loss"].append(train_metrics.get("lprm_loss", 0.0))
 
@@ -486,6 +507,9 @@ class TRMBankTrainer:
                 eval_metrics = self.evaluate()
                 history["eval_loss"].append(eval_metrics["loss"])
                 self._save_checkpoint(f"epoch_{epoch}")
+
+            if total_max > 0 and self.global_step >= total_max:
+                break
 
         self._save_checkpoint("final")
         return history
