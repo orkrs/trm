@@ -97,8 +97,13 @@ def _take_n(stream: Any, tok: Any, n: int,
             out.append({"text": text})
             kept += 1
 
-        # Progress every 100 collected or every 500 scanned
-        if kept > 0 and kept % 100 == 0:
+        # Progress: first row, then every 100 kept, or every 500 scanned
+        if scanned == 1:
+            elapsed = time.time() - t0
+            print(f"    [SCAN] First row done in {elapsed:.1f}s, "
+                  f"keep ratio {'1' if kept else '0'}/{scanned} ...")
+            _flush()
+        elif (kept > 0 and kept % 100 == 0) or (scanned % 500 == 0):
             elapsed = time.time() - t0
             speed = scanned / elapsed if elapsed > 0 else 0
             print(f"    [SCAN] Collected {kept}/{n}  |  scanned {scanned} rows  |  "
