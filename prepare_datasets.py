@@ -65,13 +65,17 @@ def _tok_len(text: str, tok: Any) -> int:
 
 # ── generic streaming helpers ──────────────────────────────────────
 
-def _stream_dataset(name: str, split: str = "train",
+def _stream_dataset(name: str, config: str = None,
+                    split: str = "train",
                     streaming: bool = True) -> Any:
     """Stream a HuggingFace dataset."""
     from datasets import load_dataset
     print(f"    [LOAD] Connecting to HuggingFace Hub ...", end=" ")
     _flush()
-    ds = load_dataset(name, split=split, streaming=streaming)
+    if config is not None:
+        ds = load_dataset(name, config, split=split, streaming=streaming)
+    else:
+        ds = load_dataset(name, split=split, streaming=streaming)
     print("done.")
     _flush()
     return ds
@@ -316,7 +320,8 @@ def main() -> None:
 
     # (b) Valley-of-Reasoning — 750 logical reasoning examples
     print("  [2b] collinear-ai/valley-of-reasoning-data  (target: 750)")
-    ds_valley = _stream_dataset("collinear-ai/valley-of-reasoning-data")
+    ds_valley = _stream_dataset("collinear-ai/valley-of-reasoning-data",
+                                config="correct_6k")
     s2_all += _take_n(ds_valley, tok, STAGE2_PER_SRC, _fmt_valley,
                       label="Valley-of-Reasoning")
 
