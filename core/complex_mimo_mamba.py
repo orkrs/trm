@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from loguru import logger
 
 
 def _rotate_2d_pairs(
@@ -993,6 +994,15 @@ class TRMBankModel(nn.Module):
         from core.mamba3_adapter import patch_mamba2_with_mamba3
 
         model = self._load_pretrained()
+
+        # Tie lm_head to embeddings if missing from checkpoint.
+        # Mamba checkpoints do not include lm_head weights.
+        if hasattr(model, "lm_head") and hasattr(model, "backbone"):
+            emb = getattr(model.backbone, "embeddings", None)
+            if emb is not None:
+                model.lm_head.weight = emb.weight
+                logger.info("lm_head.weight tied to backbone.embeddings.weight")
+
         self.backbone = model
         self._freeze_backbone()
 
