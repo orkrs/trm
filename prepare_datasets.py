@@ -64,13 +64,17 @@ def _stream_dataset(name: str, split: str = "train",
 
 
 def _take_n(stream: Any, tok: Any, n: int,
-            formatter: Any) -> List[Dict[str, str]]:
+            formatter: Any, label: str = "") -> List[Dict[str, str]]:
     """Take exactly *n* examples from a stream that pass the token limit."""
     out: List[Dict[str, str]] = []
+    scanned = 0
     for row in stream:
+        scanned += 1
         text = formatter(row)
         if text and _tok_len(text, tok) <= MAX_TOKENS:
             out.append({"text": text})
+            if len(out) % 100 == 0:
+                print(f"       Собрано {len(out)} / {n}  (просканировано {scanned} строк) ...")
         if len(out) >= n:
             break
     return out
