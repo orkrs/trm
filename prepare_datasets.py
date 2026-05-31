@@ -45,14 +45,10 @@ def _flush() -> None:
 # ── tokenizer ──────────────────────────────────────────────────────
 
 def _load_tokenizer() -> Any:
-    """Load the Mamba-2.8B tokenizer, fallback to GPT-2."""
+    """Load tokenizer. Prefer GPT-2 (matches Mamba-2.8B vocab)."""
     from transformers import AutoTokenizer
-    try:
-        tok = AutoTokenizer.from_pretrained("state-spaces/mamba-2.8b")
-        print(f"  Tokenizer loaded: state-spaces/mamba-2.8b  (vocab {tok.vocab_size})")
-    except Exception:
-        tok = AutoTokenizer.from_pretrained("gpt2")
-        print("  [WARN] Fallback to GPT-2 tokenizer")
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    print(f"  Tokenizer loaded: gpt2  (vocab {tok.vocab_size})")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     _flush()

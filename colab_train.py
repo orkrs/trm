@@ -65,9 +65,69 @@ def check_gpu() -> torch.device:
     return device
 
 
+def _load_tokenizer() -> Any:
+    """Load tokenizer. Prefer GPT-2 (matches Mamba-2.8B vocab)."""
+    from transformers import AutoTokenizer
+    try:
+        tok = AutoTokenizer.from_pretrained("gpt2")
+        print(f"  Tokenizer loaded: gpt2  (vocab {tok.vocab_size})")
+    except Exception:
+        tok = AutoTokenizer.from_pretrained("gpt2")
+        print("  [WARN] Using default GPT-2 tokenizer")
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+
+def _reconstruct_text(item: Dict[str, Any]) -> str:
+    """Reconstruct a text field from a JSONL dict that may lack 'text'.
+
+    Tries common column name patterns used by HuggingFace SFT datasets.
+    Returns empty string if nothing usable is found.
+    """
+    # 1) Already has 'text'
+    t = item.get("text", "")
+    if t:
+        return t
+
+    # 2) messages-style: list of {role, content}
+    messages = item.get("messages", item.get("conversations", []))
+    if isinstance(messages, list) and messages:
+        parts = []
+        for m in messages:
+            if isinstance(m, dict):
+                role = m.get("role", m.get("from", ""))
+                content = m.get("content", m.get("value", ""))
+                if role and content:
+                    parts.append(f"{role}: {content}")
+        if parts:
+            return "\n".join(parts)
+
+    # 3) prompt/instruction + output/response/answer
+    prompt = (item.get("prompt", "")
+              or item.get("instruction", "")
+              or item.get("question", "")
+              or item.get("input", "")
+              or item.get("problem", ""))
+    answer = (item.get("output", "")
+              or item.get("response", "")
+              or item.get("answer", "")
+              or item.get("solution", "")
+              or item.get("target", "")
+              or item.get("code", ""))
+    if prompt and answer:
+        return f"{prompt}\n{answer}"
+    if prompt:
+        return prompt
+
+    return ""
+
+
 def load_tokenized_sequences(jsonl_path: str,
                              max_seq_length: int = 1024) -> List[torch.Tensor]:
     """Load a .jsonl file, tokenize, split into chunks.
+
+    Automatically reconstructs 'text' from available fields if missing.
 
     Args:
         jsonl_path: Path to the .jsonl file.
@@ -76,25 +136,17 @@ def load_tokenized_sequences(jsonl_path: str,
     Returns:
         List of 1-D token-id tensors.
     """
-    from transformers import AutoTokenizer
-
-    try:
-        tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-2.8b")
-    except Exception:
-        print("[WARN] Mamba tokenizer not found; falling back to GPT-2 tokenizer.")
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _load_tokenizer()
 
     sequences: List[torch.Tensor] = []
+    fixed = 0
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             item = json.loads(line)
-            text = item.get("text", "")
+            text = _reconstruct_text(item)
             if not text:
                 continue
             ids = tokenizer.encode(text, truncation=False)
