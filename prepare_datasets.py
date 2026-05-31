@@ -132,32 +132,18 @@ def _fmt_deepseek_r1_math(row: Dict[str, Any]) -> str:
     return f"### Problem\n{problem}\n### Solution\n{solution}"
 
 
-def _fmt_magpie(row: Dict[str, Any]) -> str:
-    q = row.get("question", row.get("prompt", row.get("input", "")))
-    a = row.get("response", row.get("output", row.get("answer", "")))
-    if not q or not a:
-        convs = row.get("conversations", row.get("messages", []))
-        if convs:
-            parts = []
-            for turn in convs:
-                role = turn.get("from", turn.get("role", "user"))
-                val  = turn.get("value", turn.get("content", ""))
-                parts.append(f"### {role}\n{val}")
-            return "\n\n".join(parts)
-        return ""
-    return f"### Human\n{q}\n### Assistant\n{a}"
-
-
-def _fmt_sharegpt(row: Dict[str, Any]) -> str:
-    convs = row.get("conversations", row.get("messages", []))
-    if not convs:
+def _fmt_messages(row: Dict[str, Any]) -> str:
+    """Parse a messages-format row: [{"role": ..., "content": ...}, ...]."""
+    messages = row.get("messages", [])
+    if not messages:
         return ""
     parts = []
-    for turn in convs:
-        role = turn.get("from", turn.get("role", "user"))
-        val  = turn.get("value", turn.get("content", ""))
-        parts.append(f"### {role}\n{val}")
-    return "\n\n".join(parts)
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            parts.append(f"{role}: {content}")
+    return "\n".join(parts)
 
 
 # ── Stage-2 formatters ────────────────────────────────────────────
@@ -229,20 +215,29 @@ def main() -> None:
     s1_math = _take_n(ds_numina, tok, STAGE1_MATH, _fmt_numina,
                       label="NuminaMath-CoT")
 
-    # (b) Magpie-Ultra — 1 300 dialogue examples
-    print("  [1b] argilla/magpie-ultra-v1.0  (target: 1 300)")
-    ds_magpie = _stream_dataset("argilla/magpie-ultra-v1.0")
-    s1_chat = _take_n(ds_magpie, tok, STAGE1_CHAT // 2, _fmt_magpie,
-                      label="Magpie-Ultra")
+    # (b) no_robots — 1 300 instruction-following examples
+    print("  [1b] HuggingFaceH4/no_robots  (target: 1 300)")
+    ds_norobots = _stream_dataset("HuggingFaceH4/no_robots", split="train")
+    s1_chat = _take_n(ds_norobots, tok, 1300, _fmt_messages,
+                      label="no_robots")
 
-    # (c) ShareGPT-Cleaned — 1 300 dialogue examples
-    print("  [1c] Vtuber-plan/sharegpt-cleaned  (target: 1 300)")
-    ds_sg = _stream_dataset("Vtuber-plan/sharegpt-cleaned")
-    s1_chat += _take_n(ds_sg, tok, STAGE1_CHAT - len(s1_chat),
-                       _fmt_sharegpt, label="ShareGPT-Cleaned")
+    # (c) ultrachat_200k — 800 multi-turn dialogue examples
+    print("  [1c] HuggingFaceH4/ultrachat_200k  (target: 800)")
+    ds_ultra = _stream_dataset("HuggingFaceH4/ultrachat_200k",
+                               split="train_sft")
+    s1_chat += _take_n(ds_ultra, tok, 800, _fmt_messages,
+                       label="ultrachat_200k")
+
+    # (d) hh-rlhf — 500 helpful/harmless dialogue examples
+    print("  [1d] trl-internal-testing/hh-rlhf-trl-style  (target: 500)")
+    ds_hh = _stream_dataset("trl-internal-testing/hh-rlhf-trl-style",
+                            split="train")
+    s1_chat += _take_n(ds_hh, tok, 500, _fmt_messages,
+                       label="hh-rlhf")
 
     s1_all = s1_math + s1_chat
     random.shuffle(s1_all)
+    print(f"  Stage 1 breakdown: {len(s1_math)} math + {len(s1_chat)} chat = {len(s1_all)} total")
     _shuffle_and_save(s1_all, os.path.join(DATA_DIR,
                        "stage1_qrandlora.jsonl"), "Stage 1")
     print(f"  Stage 1 done in {time.time() - t_stage:.0f}s")
