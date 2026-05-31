@@ -5,14 +5,6 @@ Usage:
 
 Requirements:
     pip install datasets transformers tqdm
-
-All data is streamed (streaming=True) — nothing is fully downloaded
-to disk.  Only examples with <= 640 tokens (Mamba-2.8B tokenizer)
-are kept.
-
-Output:
-    ./data/processed/stage1_qrandlora.jsonl   (6 500 examples)
-    ./data/processed/stage2_router.jsonl      (3 000 examples)
 """
 
 from __future__ import annotations
@@ -34,7 +26,6 @@ STAGE1_TOTAL = 6_500
 STAGE1_MATH  = 3_900
 STAGE1_CHAT  = 2_600
 STAGE2_TOTAL = 3_000
-STAGE2_PER_SRC = 750
 
 
 def _flush() -> None:
@@ -64,7 +55,7 @@ def _tok_len(text: str, tok: Any) -> int:
 def _stream_dataset(name: str, config: str = None,
                     split: str = "train",
                     streaming: bool = True) -> Any:
-    """Stream a HuggingFace dataset."""
+    """Stream a HuggingFace dataset safely with config support."""
     from datasets import load_dataset
     print(f"    [LOAD] Connecting to HuggingFace Hub ...", end=" ")
     _flush()
@@ -97,7 +88,7 @@ def _take_n(stream: Any, tok: Any, n: int,
             out.append({"text": text})
             kept += 1
 
-        # Progress: first row, then every 100 kept, or every 500 scanned
+        # Вывод прогресса: первая строка, затем каждые 100 принятых
         if scanned == 1:
             elapsed = time.time() - t0
             print(f"    [SCAN] First row done in {elapsed:.1f}s, "
@@ -131,20 +122,8 @@ def _fmt_numina(row: Dict[str, Any]) -> str:
     return f"### Problem\n{problem}\n### Solution\n{solution}"
 
 
-def _fmt_deepseek_r1_math(row: Dict[str, Any]) -> str:
-    problem = row.get("problem", row.get("question", ""))
-    solution = row.get("solution", row.get("response",
-                row.get("output", "")))
-    if not problem or not solution:
-        return ""
-    return f"### Problem\n{problem}\n### Solution\n{solution}"
-
-
 def _fmt_messages(row: Dict[str, Any]) -> str:
-    """Parse a messages-format row: [{"role": ..., "content": ...}, ...].
-
-    Also handles prompt+chosen fallback for HH-RLHF style datasets.
-    """
+    """Parse a messages-format row: [{"role": ..., "content": ...}, ...]."""
     messages = row.get("messages", [])
     if messages:
         parts = []
@@ -155,7 +134,6 @@ def _fmt_messages(row: Dict[str, Any]) -> str:
                 parts.append(f"{role}: {content}")
         return "\n".join(parts)
 
-    # Fallback: prompt + chosen format (HH-RLHF style)
     prompt = row.get("prompt", "")
     chosen = row.get("chosen", "")
     if prompt and chosen:
@@ -178,6 +156,20 @@ def _fmt_stable_code(row: Dict[str, Any]) -> str:
     if not instr or not code:
         return ""
     return f"Instruction: {instr}\nCode: {code}"
+
+
+def _fmt_gpt5_frontend(row: Dict[str, Any]) -> str:
+    """Formatter for modern 2026 GPT-5.4 Coding Dataset."""
+    messages = row.get("messages", [])
+    if not messages:
+        return ""
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            parts.append(f"{role}: {content}")
+    return "\n".join(parts)
 
 
 def _fmt_flytech(row: Dict[str, Any]) -> str:
@@ -215,6 +207,20 @@ def _fmt_valley(row: Dict[str, Any]) -> str:
     return f"Instruction: {prompt}\nReasoning/Answer: {answer}"
 
 
+def _fmt_claude_reasoning(row: Dict[str, Any]) -> str:
+    """Formatter for 2026 Claude 4.6/4.7 Reasoning Dataset."""
+    messages = row.get("messages", [])
+    if not messages:
+        return ""
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            parts.append(f"{role}: {content}")
+    return "\n".join(parts)
+
+
 def _fmt_orca_math(row: Dict[str, Any]) -> str:
     """Formatter for microsoft/orca-math-word-problems-200k."""
     prompt = row.get("question", row.get("instruction", row.get("prompt", "")))
@@ -232,8 +238,6 @@ def _fmt_orca_math(row: Dict[str, Any]) -> str:
     return f"Question: {prompt}\nAnswer: {answer}"
 
 
-
-
 def _fmt_mmlupro(row: Dict[str, Any]) -> str:
     q   = row.get("question", row.get("input", ""))
     opts = row.get("options", row.get("choices", []))
@@ -248,7 +252,6 @@ def _fmt_mmlupro(row: Dict[str, Any]) -> str:
 
 def _shuffle_and_save(data: List[Dict[str, str]], path: str,
                       label: str) -> None:
-    """Shuffle *data* and write to *path* as JSONL."""
     random.shuffle(data)
     with open(path, "w", encoding="utf-8") as f:
         for item in data:
@@ -317,35 +320,47 @@ def main() -> None:
     s2_all += _take_n(ds_stable, tok, 400, _fmt_stable_code,
                       label="Stable-Code-Python-SFT")
 
-    # (a2) flytech/python-codes-25k — 200 code generation examples
-    print("  [2a2] flytech/python-codes-25k  (target: 200)")
+    # (a2) GPT-5.4 Frontend SFT (May 2026 SOTA Coding) — 200 examples
+    print("  [2a2] runanlab/gpt-5.4-frontend-development-27052026  (target: 200)")
+    ds_gpt5 = _stream_dataset("runanlab/gpt-5.4-frontend-development-27052026", split="train")
+    s2_all += _take_n(ds_gpt5, tok, 200, _fmt_gpt5_frontend,
+                      label="GPT-5.4-Coding")
+
+    # (a3) flytech/python-codes-25k — 150 examples
+    print("  [2a3] flytech/python-codes-25k  (target: 150)")
     ds_flytech = _stream_dataset("flytech/python-codes-25k")
-    s2_all += _take_n(ds_flytech, tok, 200, _fmt_flytech,
+    s2_all += _take_n(ds_flytech, tok, 150, _fmt_flytech,
                       label="python-codes-25k")
 
-    # (a3) glaive-code-assistant-v3 — 150 code Q&A examples
-    print("  [2a3] glaiveai/glaive-code-assistant-v3  (target: 150)")
+    # (a4) glaive-code-assistant-v3 — 150 code Q&A examples
+    print("  [2a4] glaiveai/glaive-code-assistant-v3  (target: 150)")
     ds_glaive = _stream_dataset("glaiveai/glaive-code-assistant-v3")
     s2_all += _take_n(ds_glaive, tok, 150, _fmt_glaive,
                       label="glaive-code-assistant-v3")
 
-    # (b) Valley-of-Reasoning — 750 logical reasoning examples
-    print("  [2b] collinear-ai/valley-of-reasoning-data  (target: 750)")
+    # (b) Valley-of-Reasoning (Fixed!) — 500 logical reasoning examples
+    print("  [2b] collinear-ai/valley-of-reasoning-data  (target: 500)")
     ds_valley = _stream_dataset("collinear-ai/valley-of-reasoning-data",
                                 config="correct_6k")
-    s2_all += _take_n(ds_valley, tok, STAGE2_PER_SRC, _fmt_valley,
+    s2_all += _take_n(ds_valley, tok, 500, _fmt_valley,
                       label="Valley-of-Reasoning")
 
-    # (c) Orca-Math — 750 math word problems for SymPy routing
-    print("  [2c] microsoft/orca-math-word-problems-200k  (target: 750)")
+    # (b2) Claude 4.6/4.7 Reasoning — 600 logical reasoning examples (May 2026 SOTA)
+    print("  [2b2] angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k  (target: 600)")
+    ds_claude = _stream_dataset("angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k", split="train")
+    s2_all += _take_n(ds_claude, tok, 600, _fmt_claude_reasoning,
+                      label="Claude-Reasoning")
+
+    # (c) Orca-Math — 500 math word problems for SymPy routing
+    print("  [2c] microsoft/orca-math-word-problems-200k  (target: 500)")
     ds_orca = _stream_dataset("microsoft/orca-math-word-problems-200k")
-    s2_all += _take_n(ds_orca, tok, STAGE2_PER_SRC, _fmt_orca_math,
+    s2_all += _take_n(ds_orca, tok, 500, _fmt_orca_math,
                       label="Orca-Math")
 
-    # (d) MMLU-Pro — 750 factual
-    print("  [2d] TIGER-Lab/MMLU-Pro  (target: 750)")
+    # (d) MMLU-Pro — 500 factual
+    print("  [2d] TIGER-Lab/MMLU-Pro  (target: 500)")
     ds_mmlu = _stream_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    s2_all += _take_n(ds_mmlu, tok, STAGE2_PER_SRC, _fmt_mmlupro,
+    s2_all += _take_n(ds_mmlu, tok, 500, _fmt_mmlupro,
                       label="MMLU-Pro")
 
     random.shuffle(s2_all)
