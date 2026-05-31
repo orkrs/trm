@@ -224,18 +224,14 @@ def patch_mamba2_with_mamba3(
             device=device, dtype=dtype,
         )
 
-        with torch.no_grad():
-            adapter.conv1d.weight.copy_(orig_mixer.conv1d.weight)
-            if orig_mixer.conv1d.bias is not None:
-                adapter.conv1d.bias.copy_(orig_mixer.conv1d.bias)
-
-            adapter.in_proj.weight.copy_(orig_mixer.in_proj.weight)
-            if orig_mixer.in_proj.bias is not None:
-                adapter.in_proj.bias.copy_(orig_mixer.in_proj.bias)
-
-            adapter.out_proj.weight.copy_(orig_mixer.out_proj.weight)
-            if orig_mixer.out_proj.bias is not None:
-                adapter.out_proj.bias.copy_(orig_mixer.out_proj.bias)
+        # Reference original modules directly instead of copying.
+        # With 4-bit quantization, weights are stored as flat Params4bit
+        # tensors, so .copy_() fails with shape mismatch.  By referencing
+        # the original modules we avoid duplicating VRAM and guarantee
+        # compatibility with quantized weights.
+        adapter.conv1d = orig_mixer.conv1d
+        adapter.in_proj = orig_mixer.in_proj
+        adapter.out_proj = orig_mixer.out_proj
 
         child.mixer = adapter
         count += 1
