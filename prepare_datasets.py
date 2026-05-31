@@ -250,8 +250,8 @@ def main() -> None:
     s2_all: List[Dict[str, str]] = []
 
     # (a) LiveCodeBench — 750 code generation
-    print("  [2a] livecodebench/code_generation_lite  (target: 750)")
-    ds_lcb = _stream_dataset("livecodebench/code_generation_lite")
+    print("  [2a] lighteval/code_generation_lite  (target: 750)")
+    ds_lcb = _stream_dataset("lighteval/code_generation_lite")
     s2_all += _take_n(ds_lcb, tok, STAGE2_PER_SRC, _fmt_livecodebench,
                       label="LiveCodeBench")
 
@@ -262,8 +262,8 @@ def main() -> None:
                       label="MuSR")
 
     # (c) BBH — 750 hard reasoning
-    print("  [2c] lukaemon/bbh  (target: 750)")
-    ds_bbh = _stream_dataset("lukaemon/bbh")
+    print("  [2c] maveriq/bigbenchhard  (target: 750)")
+    ds_bbh = _stream_dataset("maveriq/bigbenchhard")
     s2_all += _take_n(ds_bbh, tok, STAGE2_PER_SRC, _fmt_bbh,
                       label="BBH")
 
