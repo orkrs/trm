@@ -52,17 +52,12 @@ def _tok_len(text: str, tok: Any) -> int:
 
 # ── generic streaming helpers ──────────────────────────────────────
 
-def _stream_dataset(name: str, config: str = None,
-                    split: str = "train",
-                    streaming: bool = True) -> Any:
-    """Stream a HuggingFace dataset safely with config support."""
+def _stream_dataset(name: str, split: str = "train", streaming: bool = True) -> Any:
+    """Stream a HuggingFace dataset safely without python script issues."""
     from datasets import load_dataset
     print(f"    [LOAD] Connecting to HuggingFace Hub ...", end=" ")
     _flush()
-    if config is not None:
-        ds = load_dataset(name, config, split=split, streaming=streaming)
-    else:
-        ds = load_dataset(name, split=split, streaming=streaming)
+    ds = load_dataset(name, split=split, streaming=streaming)
     print("done.")
     _flush()
     return ds
@@ -158,20 +153,6 @@ def _fmt_stable_code(row: Dict[str, Any]) -> str:
     return f"Instruction: {instr}\nCode: {code}"
 
 
-def _fmt_gpt5_frontend(row: Dict[str, Any]) -> str:
-    """Formatter for modern 2026 GPT-5.4 Coding Dataset."""
-    messages = row.get("messages", [])
-    if not messages:
-        return ""
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role and content:
-            parts.append(f"{role}: {content}")
-    return "\n".join(parts)
-
-
 def _fmt_flytech(row: Dict[str, Any]) -> str:
     """Formatter for flytech/python-codes-25k."""
     instr = row.get("instruction", "")
@@ -188,23 +169,6 @@ def _fmt_glaive(row: Dict[str, Any]) -> str:
     if not q or not a:
         return ""
     return f"Question: {q}\nAnswer: {a}"
-
-
-def _fmt_valley(row: Dict[str, Any]) -> str:
-    """Formatter for collinear-ai/valley-of-reasoning-data."""
-    prompt = row.get("instruction", row.get("input", row.get("prompt", "")))
-    answer = row.get("output", row.get("response", row.get("target", "")))
-    if isinstance(prompt, list):
-        prompt = "\n".join(
-            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in prompt
-        )
-    if isinstance(answer, list):
-        answer = "\n".join(
-            f"{m.get('role', 'assistant')}: {m.get('content', '')}" for m in answer
-        )
-    if not prompt or not answer:
-        return ""
-    return f"Instruction: {prompt}\nReasoning/Answer: {answer}"
 
 
 def _fmt_claude_reasoning(row: Dict[str, Any]) -> str:
@@ -314,41 +278,28 @@ def main() -> None:
 
     s2_all: List[Dict[str, str]] = []
 
-    # (a) Stable-Code-Python-SFT — 400 code generation examples
-    print("  [2a] bunyaminergen/Stable-Code-Python-SFT  (target: 400)")
+    # (a) Stable-Code-Python-SFT — 500 code generation examples
+    print("  [2a] bunyaminergen/Stable-Code-Python-SFT  (target: 500)")
     ds_stable = _stream_dataset("bunyaminergen/Stable-Code-Python-SFT")
-    s2_all += _take_n(ds_stable, tok, 400, _fmt_stable_code,
+    s2_all += _take_n(ds_stable, tok, 500, _fmt_stable_code,
                       label="Stable-Code-Python-SFT")
 
-    # (a2) GPT-5.4 Frontend SFT (May 2026 SOTA Coding) — 200 examples
-    print("  [2a2] runanlab/gpt-5.4-frontend-development-27052026  (target: 200)")
-    ds_gpt5 = _stream_dataset("runanlab/gpt-5.4-frontend-development-27052026", split="train")
-    s2_all += _take_n(ds_gpt5, tok, 200, _fmt_gpt5_frontend,
-                      label="GPT-5.4-Coding")
-
-    # (a3) flytech/python-codes-25k — 150 examples
-    print("  [2a3] flytech/python-codes-25k  (target: 150)")
+    # (a2) flytech/python-codes-25k — 250 examples
+    print("  [2a2] flytech/python-codes-25k  (target: 250)")
     ds_flytech = _stream_dataset("flytech/python-codes-25k")
-    s2_all += _take_n(ds_flytech, tok, 150, _fmt_flytech,
+    s2_all += _take_n(ds_flytech, tok, 250, _fmt_flytech,
                       label="python-codes-25k")
 
-    # (a4) glaive-code-assistant-v3 — 150 code Q&A examples
-    print("  [2a4] glaiveai/glaive-code-assistant-v3  (target: 150)")
+    # (a3) glaive-code-assistant-v3 — 150 code Q&A examples
+    print("  [2a3] glaiveai/glaive-code-assistant-v3  (target: 150)")
     ds_glaive = _stream_dataset("glaiveai/glaive-code-assistant-v3")
     s2_all += _take_n(ds_glaive, tok, 150, _fmt_glaive,
                       label="glaive-code-assistant-v3")
 
-    # (b) Valley-of-Reasoning (Fixed!) — 500 logical reasoning examples
-    print("  [2b] collinear-ai/valley-of-reasoning-data  (target: 500)")
-    ds_valley = _stream_dataset("collinear-ai/valley-of-reasoning-data",
-                                config="correct_6k")
-    s2_all += _take_n(ds_valley, tok, 500, _fmt_valley,
-                      label="Valley-of-Reasoning")
-
-    # (b2) Claude 4.6/4.7 Reasoning — 600 logical reasoning examples (May 2026 SOTA)
-    print("  [2b2] angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k  (target: 600)")
+    # (b) Claude 4.6/4.7 Reasoning — 1100 logical reasoning examples (May 2026 SOTA)
+    print("  [2b] angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k  (target: 1100)")
     ds_claude = _stream_dataset("angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k", split="train")
-    s2_all += _take_n(ds_claude, tok, 600, _fmt_claude_reasoning,
+    s2_all += _take_n(ds_claude, tok, 1100, _fmt_claude_reasoning,
                       label="Claude-Reasoning")
 
     # (c) Orca-Math — 500 math word problems for SymPy routing
