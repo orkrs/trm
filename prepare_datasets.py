@@ -193,12 +193,22 @@ def _fmt_glaive(row: Dict[str, Any]) -> str:
     return f"Question: {q}\nAnswer: {a}"
 
 
-def _fmt_musr(row: Dict[str, Any]) -> str:
-    q = row.get("question", row.get("input", row.get("prompt", "")))
-    a = row.get("answer", row.get("output", row.get("response", "")))
-    if not q or not a:
+def _fmt_valley(row: Dict[str, Any]) -> str:
+    """Formatter for collinear-ai/valley-of-reasoning-data."""
+    prompt = row.get("instruction", row.get("input", row.get("prompt", "")))
+    answer = row.get("output", row.get("response", row.get("target", "")))
+    if isinstance(prompt, list):
+        prompt = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in prompt
+        )
+    if isinstance(answer, list):
+        answer = "\n".join(
+            f"{m.get('role', 'assistant')}: {m.get('content', '')}" for m in answer
+        )
+    if not prompt or not answer:
         return ""
-    return f"### Question\n{q}\n### Answer\n{a}"
+    return f"Instruction: {prompt}\nReasoning/Answer: {answer}"
+
 
 
 def _fmt_bbh(row: Dict[str, Any]) -> str:
@@ -304,11 +314,11 @@ def main() -> None:
     s2_all += _take_n(ds_glaive, tok, 150, _fmt_glaive,
                       label="glaive-code-assistant-v3")
 
-    # (b) MuSR — 750 multi-step reasoning
-    print("  [2b] TAUR-Lab/MuSR  (target: 750)")
-    ds_musr = _stream_dataset("TAUR-Lab/MuSR")
-    s2_all += _take_n(ds_musr, tok, STAGE2_PER_SRC, _fmt_musr,
-                      label="MuSR")
+    # (b) Valley-of-Reasoning — 750 logical reasoning examples
+    print("  [2b] collinear-ai/valley-of-reasoning-data  (target: 750)")
+    ds_valley = _stream_dataset("collinear-ai/valley-of-reasoning-data")
+    s2_all += _take_n(ds_valley, tok, STAGE2_PER_SRC, _fmt_valley,
+                      label="Valley-of-Reasoning")
 
     # (c) BBH — 750 hard reasoning
     print("  [2c] maveriq/bigbenchhard  (target: 750)")
