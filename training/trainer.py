@@ -1,0 +1,491 @@
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from loguru import logger
+from torch.utils.data import DataLoader, IterableDataset
+from tqdm import tqdm
+
+from config import CONFIG, TrainingConfig
+from memory.hierarchical_memory import HierarchicalMemory
+
+
+class TruncatedBPTTDataset(IterableDataset):
+    """Wrapper that splits long sequences into truncated chunks.
+
+    Each chunk has length at most truncation_length.  Chunks from
+    the same original sequence are yielded sequentially so the
+    training loop can carry hidden state across chunks and detach
+    at segment boundaries.
+
+    Args:
+        data: List of tokenized sequences (variable length).
+        truncation_length: Maximum tokens per chunk.
+        seq_length: Maximum total sequence length (sequences longer
+                    than this are split into separate items).
+    """
+
+    def __init__(
+        self,
+        data: List[torch.Tensor],
+        truncation_length: int = 2048,
+        seq_length: int = 8192,
+    ) -> None:
+        super().__init__()
+        self.data: List[torch.Tensor] = data
+        self.truncation_length: int = truncation_length
+        self.seq_length: int = seq_length
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        worker_info = torch.utils.data.get_worker_info()
+        data = self.data
+        if worker_info is not None:
+            data = data[worker_info.id::worker_info.num_workers]
+
+        for seq in data:
+            seq = seq[:self.seq_length]
+            for start in range(0, len(seq), self.truncation_length):
+                end = min(start + self.truncation_length, len(seq))
+                chunk = seq[start:end]
+                if chunk.numel() < 2:
+                    continue
+                yield {
+                    "input_ids": chunk.unsqueeze(0),
+                    "labels": chunk.unsqueeze(0),
+                    "segment_start": start,
+                    "is_last": end >= len(seq),
+                }
+
+    def __len__(self) -> int:
+        total = 0
+        for seq in self.data:
+            total += max(1, (min(len(seq), self.seq_length) + self.truncation_length - 1)
+                         // self.truncation_length)
+        return total
+
+
+class TRMBankTrainer:
+    """Truncated BPTT trainer for TRM-Bank v3.0.
+
+    Trains only the QRandLoRA adaptation parameters and the LPRM
+    head while keeping the pretrained Mamba backbone frozen.
+
+    The training loop:
+        1. Splits long sequences into truncation_length segments.
+        2. Processes each segment sequentially, detaching the hidden
+           state at segment boundaries (truncated BPTT).
+        3. Accumulates gradients across segments within a sequence.
+        4. Applies gradient clipping and optimizer step per sequence.
+
+    Args:
+        model: The TRMBankModel instance (must be built).
+        lprm: Optional MultiHeadLPRM for quality prediction (trained jointly).
+        config: Training configuration.
+        train_dataset: IterableDataset yielding truncated chunks.
+        eval_dataset: Optional dataset for evaluation.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        lprm: Optional[nn.Module] = None,
+        config: TrainingConfig = CONFIG.training,
+        train_dataset: Optional[IterableDataset] = None,
+        eval_dataset: Optional[IterableDataset] = None,
+        memory: Optional[HierarchicalMemory] = None,
+    ) -> None:
+        self.model: nn.Module = model
+        self.lprm: Optional[nn.Module] = lprm
+        self.config: TrainingConfig = config
+        self.train_dataset: Optional[IterableDataset] = train_dataset
+        self.eval_dataset: Optional[IterableDataset] = eval_dataset
+        self.memory: Optional[HierarchicalMemory] = memory
+
+        # Collect trainable parameters (QRandLoRA + LPRM only).
+        trainable_params: List[torch.Tensor] = []
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                trainable_params.append(param)
+                logger.debug(f"Trainable param: {name}, shape={param.shape}")
+
+        if self.lprm is not None:
+            trainable_params.extend(
+                p for p in self.lprm.parameters() if p.requires_grad
+            )
+
+        if not trainable_params:
+            logger.warning("No trainable parameters found. Check requires_grad flags.")
+
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        # Linear warmup + cosine decay scheduler.
+        total_steps = config.num_epochs * (
+            len(train_dataset) if train_dataset is not None else 1000
+        )
+        warmup_steps = config.warmup_steps
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step) / float(max(1, warmup_steps))
+            progress = float(step - warmup_steps) / float(
+                max(1, total_steps - warmup_steps)
+            )
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda
+        )
+
+        self.global_step: int = 0
+        self.best_eval_loss: float = float("inf")
+
+    def _compute_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute cross-entropy language modeling loss.
+
+        Args:
+            logits: Predicted logits of shape (B, L, V).
+            labels: Target token ids of shape (B, L).
+
+        Returns:
+            Scalar loss tensor.
+        """
+        B, L, V = logits.shape
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, V),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+        return loss
+
+    def _compute_lprm_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute LPRM auxiliary loss from model confidence.
+
+        For each token position, the target reward is the model's
+        predicted probability of the correct token (soft target in
+        [0, 1]).  All LPRM heads predict this same target, teaching
+        them to recognise when the model is confident vs uncertain.
+
+        Args:
+            logits: Predicted logits of shape (B, L, V).
+            labels: Target token ids of shape (B, L).
+            hidden_states: Final layer hidden states of shape (B, L, D).
+
+        Returns:
+            Scalar LPRM loss tensor.
+        """
+        if self.lprm is None:
+            return torch.tensor(0.0, device=logits.device)
+
+        probs = F.softmax(logits, dim=-1)                              # (B, L, V)
+        p_correct = probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # (B, L)
+        target = p_correct.unsqueeze(-1)                                 # (B, L, 1)
+
+        q_pred = self.lprm(hidden_states)                               # (B, L, M)
+        loss = F.mse_loss(q_pred, target.expand_as(q_pred))
+        return loss
+
+    def train_lprm_on_replay(
+        self,
+        batch_size: int = 16,
+        lr: float = 1e-4,
+        num_steps: int = 32,
+    ) -> float:
+        """Train LPRM heads from the memory replay buffer.
+
+        Samples experiences generated during inference and trains the
+        LPRM head to predict the actual reward from the hidden state
+        that was used at auction time.
+
+        Args:
+            batch_size: Number of experiences per step.
+            lr: Learning rate for the inner optimiser.
+            num_steps: Number of gradient steps.
+
+        Returns:
+            Average LPRM replay loss over the last batch.
+        """
+        if self.lprm is None or self.memory is None:
+            logger.warning("No LPRM or memory attached; skipping replay training.")
+            return 0.0
+
+        replay = self.memory.replay
+        if len(replay) < 2:
+            logger.warning(f"Replay buffer too small ({len(replay)}); skipping.")
+            return 0.0
+
+        self.lprm.train()
+        optim = torch.optim.AdamW(self.lprm.parameters(), lr=lr)
+
+        device = next(self.model.parameters()).device
+        module_names = self.lprm.module_names if hasattr(self.lprm, "module_names") else []
+        name_to_idx = {name: i for i, name in enumerate(module_names)}
+
+        avg_loss: float = 0.0
+        for step in range(num_steps):
+            exps = replay.sample(batch_size)
+            if not exps:
+                break
+
+            hidden_states: List[torch.Tensor] = []
+            targets: List[float] = []
+            for exp in exps:
+                hidden_states.append(exp.hidden_for_lprm.to(device))
+                targets.append(exp.reward)
+
+            h: torch.Tensor = torch.cat(hidden_states, dim=0)           # (B, D)
+
+            module_idx = name_to_idx.get(exps[0].module_name, 0)
+            q_pred: torch.Tensor = self.lprm(h, module_idx=module_idx)  # (B, 1)
+            true = torch.tensor(targets, device=device, dtype=q_pred.dtype).unsqueeze(-1)
+            # true: (B, 1)
+
+            loss = F.mse_loss(q_pred, true)
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+            avg_loss = loss.item()
+
+        self.lprm.eval()
+        return avg_loss
+
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """Run one training epoch with truncated BPTT.
+
+        States are carried across segments of the same sequence
+        and detached at segment boundaries.
+
+        Args:
+            epoch: Current epoch number (for logging).
+
+        Returns:
+            Dictionary of average metrics for the epoch.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("No training dataset provided.")
+
+        self.model.train()
+        if self.lprm is not None:
+            self.lprm.train()
+
+        total_loss: float = 0.0
+        total_lprm_loss: float = 0.0
+        total_tokens: int = 0
+        num_batches: int = 0
+        states: Any = None
+
+        dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=None,
+            num_workers=0,
+        )
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="chunk")
+        for batch in pbar:
+            input_ids = batch["input_ids"]             # (1, L_chunk)
+            labels = batch["labels"]                   # (1, L_chunk)
+            is_last = batch["is_last"]
+
+            input_ids = input_ids.to(next(self.model.parameters()).device)
+            labels = labels.to(next(self.model.parameters()).device)
+
+            kwargs: Dict[str, Any] = {"input_ids": input_ids}
+            if states is not None:
+                kwargs["states"] = states
+
+            # Try return_states; some models (e.g. TinyTRMModel) support it.
+            # If the model doesn't accept it, catch TypeError.
+            try:
+                outputs = self.model(return_states=True, **kwargs)
+                states = outputs.get("states", None)
+            except TypeError:
+                outputs = self.model(**kwargs)
+
+            logits = outputs["logits"]
+            hidden_states = outputs.get("hidden_states", None)
+
+            # Language modelling loss.
+            lm_loss = self._compute_loss(logits, labels)
+            loss = lm_loss / self.config.gradient_accumulation_steps
+
+            # LPRM auxiliary loss (teaches heads to predict model confidence).
+            if self.lprm is not None and hidden_states is not None:
+                lprm_loss = self._compute_lprm_loss(logits, labels, hidden_states)
+                loss = loss + (self.config.lprm_weight * lprm_loss)
+                total_lprm_loss += lprm_loss.item()
+
+            loss.backward()
+
+            total_loss += lm_loss.item()
+            total_tokens += labels.numel()
+            num_batches += 1
+
+            # Gradient accumulation step.
+            if (num_batches % self.config.gradient_accumulation_steps == 0) or is_last:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.gradient_clip,
+                )
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                self.global_step += 1
+
+            # Logging.
+            if self.global_step % self.config.log_every_n_steps == 0 and num_batches > 0:
+                avg_loss = total_loss / max(1, num_batches)
+                avg_lprm = total_lprm_loss / max(1, num_batches)
+                lr = self.scheduler.get_last_lr()[0]
+                logger.info(
+                    f"Step {self.global_step} | loss={avg_loss:.4f} | "
+                    f"lprm={avg_lprm:.4f} | lr={lr:.2e} | tokens={total_tokens}"
+                )
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", lprm=f"{avg_lprm:.4f}", lr=f"{lr:.2e}")
+
+            # Evaluation.
+            if (self.global_step % self.config.eval_every_n_steps == 0
+                    and self.eval_dataset is not None):
+                eval_metrics = self.evaluate()
+                logger.info(f"Eval at step {self.global_step}: {eval_metrics}")
+                if eval_metrics.get("loss", float("inf")) < self.best_eval_loss:
+                    self.best_eval_loss = eval_metrics["loss"]
+                    self._save_checkpoint("best")
+                self.model.train()
+
+            # Detach states for truncated BPTT at segment boundaries.
+            if is_last:
+                states = None
+            elif states is not None:
+                states = [s.detach() for s in states]
+
+        avg_epoch_loss = total_loss / max(1, num_batches)
+        avg_epoch_lprm = total_lprm_loss / max(1, num_batches)
+        logger.info(
+            f"Epoch {epoch} complete. avg_loss={avg_epoch_loss:.4f} "
+            f"avg_lprm_loss={avg_epoch_lprm:.4f}"
+        )
+        return {"loss": avg_epoch_loss, "lprm_loss": avg_epoch_lprm, "tokens": total_tokens}
+
+    @torch.no_grad()
+    def evaluate(self) -> Dict[str, float]:
+        """Evaluate on the evaluation dataset.
+
+        Returns:
+            Dictionary of evaluation metrics.
+        """
+        if self.eval_dataset is None:
+            return {"loss": float("nan")}
+
+        self.model.eval()
+        if self.lprm is not None:
+            self.lprm.eval()
+
+        total_loss: float = 0.0
+        num_batches: int = 0
+
+        dataloader = DataLoader(
+            self.eval_dataset,
+            batch_size=None,
+            num_workers=0,
+        )
+
+        for batch in dataloader:
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+            input_ids = input_ids.to(next(self.model.parameters()).device)
+            labels = labels.to(next(self.model.parameters()).device)
+
+            outputs = self.model(input_ids=input_ids)
+            logits = outputs["logits"]
+            loss = self._compute_loss(logits, labels)
+            total_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = total_loss / max(1, num_batches)
+        return {"loss": avg_loss}
+
+    def _save_checkpoint(self, tag: str = "latest") -> str:
+        """Save model and optimizer state.
+
+        Args:
+            tag: Checkpoint tag (e.g., "latest", "best").
+
+        Returns:
+            Path to the saved checkpoint.
+        """
+        path = f"{self.config.output_dir}/checkpoint_{tag}.pt"
+        state = {
+            "model_state": self.model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+            "global_step": self.global_step,
+            "best_eval_loss": self.best_eval_loss,
+        }
+        if self.lprm is not None:
+            state["lprm_state"] = self.lprm.state_dict()
+        torch.save(state, path)
+        logger.info(f"Checkpoint saved to {path}")
+        return path
+
+    def load_checkpoint(self, path: str) -> None:
+        """Load model and optimizer state from a checkpoint.
+
+        Args:
+            path: Path to the checkpoint file.
+        """
+        state = torch.load(path, map_location="cpu")
+        self.model.load_state_dict(state["model_state"], strict=False)
+        self.optimizer.load_state_dict(state["optimizer_state"])
+        self.scheduler.load_state_dict(state["scheduler_state"])
+        self.global_step = state["global_step"]
+        self.best_eval_loss = state["best_eval_loss"]
+        if self.lprm is not None and "lprm_state" in state:
+            self.lprm.load_state_dict(state["lprm_state"])
+        logger.info(f"Checkpoint loaded from {path} (step {self.global_step})")
+
+    def train(self, num_epochs: Optional[int] = None) -> Dict[str, List[float]]:
+        """Run the full training loop.
+
+        Args:
+            num_epochs: Override for the configured number of epochs.
+
+        Returns:
+            Dictionary of training history.
+        """
+        n_epochs = num_epochs or self.config.num_epochs
+        history: Dict[str, List[float]] = {
+            "train_loss": [],
+            "train_lprm_loss": [],
+            "eval_loss": [],
+        }
+
+        for epoch in range(1, n_epochs + 1):
+            train_metrics = self.train_epoch(epoch)
+            history["train_loss"].append(train_metrics["loss"])
+            history["train_lprm_loss"].append(train_metrics.get("lprm_loss", 0.0))
+
+            if self.eval_dataset is not None:
+                eval_metrics = self.evaluate()
+                history["eval_loss"].append(eval_metrics["loss"])
+                self._save_checkpoint(f"epoch_{epoch}")
+
+        self._save_checkpoint("final")
+        return history
