@@ -297,9 +297,9 @@ def main() -> None:
                       label="glaive-code-assistant-v3")
 
     # (b) Claude 4.6/4.7 Reasoning — 1100 logical reasoning examples (May 2026 SOTA)
-    print("  [2b] angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k  (target: 1100)")
+    print("  [2b] angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k  (target: 1000)")
     ds_claude = _stream_dataset("angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k", split="train")
-    s2_all += _take_n(ds_claude, tok, 1100, _fmt_claude_reasoning,
+    s2_all += _take_n(ds_claude, tok, 1000, _fmt_claude_reasoning,
                       label="Claude-Reasoning")
 
     # (c) Orca-Math — 500 math word problems for SymPy routing
