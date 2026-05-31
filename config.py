@@ -9,10 +9,10 @@ import torch
 
 @dataclass(frozen=True)
 class ModelConfig:
-    pretrained_model_name: str = "state-spaces/mamba-2.8b-hf"
+    pretrained_model_name: str = "state-spaces/mamba-1.4b-hf"
     quantization_bits: int = 4
     quantization_type: str = "nf4"
-    hidden_dim: int = 2560
+    hidden_dim: int = 2048
     d_state: int = 64
     d_conv: int = 4
     expand_factor: int = 2
@@ -22,7 +22,7 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class ComplexMIMOConfig:
-    mimo_rank: int = 4
+    mimo_rank: int = 2
     complex_state_dim: int = 32
     use_complex: bool = True
     discretization_order: int = 2

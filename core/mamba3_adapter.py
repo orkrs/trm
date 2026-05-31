@@ -215,6 +215,12 @@ def patch_mamba2_with_mamba3(
             raise RuntimeError(f"{type(child).__name__} at '{_name}' has no .mixer.")
 
         orig_mixer = child.mixer
+
+        # Checkerboard hybrid optimization for Tesla T4 OOM protection
+        # (patch only even layers: 24 out of 48)
+        if getattr(orig_mixer, "layer_idx", 0) % 2 != 0:
+            continue
+
         config: MambaConfig = orig_mixer.config
         layer_idx: int = orig_mixer.layer_idx
 
