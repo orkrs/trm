@@ -133,17 +133,27 @@ def _fmt_deepseek_r1_math(row: Dict[str, Any]) -> str:
 
 
 def _fmt_messages(row: Dict[str, Any]) -> str:
-    """Parse a messages-format row: [{"role": ..., "content": ...}, ...]."""
+    """Parse a messages-format row: [{"role": ..., "content": ...}, ...].
+
+    Also handles prompt+chosen fallback for HH-RLHF style datasets.
+    """
     messages = row.get("messages", [])
-    if not messages:
-        return ""
-    parts = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role and content:
-            parts.append(f"{role}: {content}")
-    return "\n".join(parts)
+    if messages:
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role and content:
+                parts.append(f"{role}: {content}")
+        return "\n".join(parts)
+
+    # Fallback: prompt + chosen format (HH-RLHF style)
+    prompt = row.get("prompt", "")
+    chosen = row.get("chosen", "")
+    if prompt and chosen:
+        return f"user: {prompt}\nassistant: {chosen}"
+
+    return ""
 
 
 # ── Stage-2 formatters ────────────────────────────────────────────
@@ -251,7 +261,7 @@ def main() -> None:
 
     # (a) LiveCodeBench — 750 code generation
     print("  [2a] lighteval/code_generation_lite  (target: 750)")
-    ds_lcb = _stream_dataset("lighteval/code_generation_lite")
+    ds_lcb = _stream_dataset("lighteval/code_generation_lite", split="test")
     s2_all += _take_n(ds_lcb, tok, STAGE2_PER_SRC, _fmt_livecodebench,
                       label="LiveCodeBench")
 
