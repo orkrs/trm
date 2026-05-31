@@ -869,9 +869,9 @@ class TinyTRMModel(nn.Module):
 
 
 class TRMBankModel(nn.Module):
-    """TRM-Bank v3.0: wrapper over 4-bit quantized Mamba-2.8B.
+    """TRM-Bank v3.0: wrapper over 4-bit quantized Mamba-1.4B.
 
-    Loads the pretrained Mamba-2.8B model in 4-bit NF4 format via
+    Loads the pretrained Mamba-1.4B model in 4-bit NF4 format via
     bitsandbytes, freezes all backbone weights, and enriches hidden
     states with ComplexMIMOScan branch features.
 
@@ -879,7 +879,7 @@ class TRMBankModel(nn.Module):
     For a self-contained alternative see TinyTRMModel.
 
     Args:
-        pretrained_name: HuggingFace model name for Mamba-2.8B.
+        pretrained_name: HuggingFace model name for Mamba-1.4B.
         mimo_rank: Number of parallel MIMO branches (R).
         d_state: Real-valued SSM state dimension (N, must be even).
         use_4bit: Whether to load in 4-bit NF4 quantization.
@@ -984,7 +984,7 @@ class TRMBankModel(nn.Module):
     def build(self) -> None:
         """Load the pretrained backbone and replace all SSM mixers.
 
-        Loads Mamba-2.8B in 4-bit NF4, freezes backbone weights,
+        Loads Mamba-1.4B in 4-bit NF4, freezes backbone weights,
         then replaces every ``MambaBlock.mixer`` with
         ``Mamba3MixerAdapter`` (which wraps ``ComplexMIMOMamba3``).
 

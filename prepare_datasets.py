@@ -33,7 +33,7 @@ def _flush() -> None:
 # ── tokenizer ──────────────────────────────────────────────────────
 
 def _load_tokenizer() -> Any:
-    """Load tokenizer. Prefer GPT-2 (matches Mamba-2.8B vocab)."""
+    """Load tokenizer. Prefer GPT-2 (matches Mamba-1.4B vocab)."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("gpt2")
     print(f"  Tokenizer loaded: gpt2  (vocab {tok.vocab_size})")

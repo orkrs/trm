@@ -5,7 +5,7 @@ Usage:
     python verify_modules.py     # 2. verify providers
     python colab_train.py        # 3. train
 
-The script downloads Mamba-2.8B in 4-bit NF4, patches all SSM mixers
+The script downloads Mamba-1.4B in 4-bit NF4, patches all SSM mixers
 with ComplexMIMOMamba3, applies QRandLoRA (r=64), attaches the LPRM
 head and game-theoretic router, and runs truncated-BPTT training.
 """
@@ -66,7 +66,7 @@ def check_gpu() -> torch.device:
 
 
 def _load_tokenizer() -> Any:
-    """Load tokenizer. Prefer GPT-2 (matches Mamba-2.8B vocab)."""
+    """Load tokenizer. Prefer GPT-2 (matches Mamba-1.4B vocab)."""
     from transformers import AutoTokenizer
     try:
         tok = AutoTokenizer.from_pretrained("gpt2")
@@ -195,7 +195,7 @@ def build_trainer_for_stage(
     print(f"  Dataset chunks: {len(train_dataset)}")
 
     # ---- 2. Build TRMBankModel ----
-    print("\n[2/5] Building TRMBankModel (Mamba-2.8B 4-bit)...")
+    print("\n[2/5] Building TRMBankModel (Mamba-1.4B 4-bit)...")
     model = TRMBankModel(
         pretrained_name="state-spaces/mamba-1.4b-hf",
         mimo_rank=CONFIG.mimo.mimo_rank,
