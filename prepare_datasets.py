@@ -214,13 +214,23 @@ def _fmt_valley(row: Dict[str, Any]) -> str:
     return f"Instruction: {prompt}\nReasoning/Answer: {answer}"
 
 
-
-def _fmt_bbh(row: Dict[str, Any]) -> str:
-    q = row.get("input", row.get("question", row.get("prompt", "")))
-    a = row.get("target", row.get("answer", row.get("output", "")))
-    if not q or not a:
+def _fmt_orca_math(row: Dict[str, Any]) -> str:
+    """Formatter for microsoft/orca-math-word-problems-200k."""
+    prompt = row.get("question", row.get("instruction", row.get("prompt", "")))
+    answer = row.get("answer", row.get("output", row.get("response", "")))
+    if isinstance(prompt, list):
+        prompt = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}" for m in prompt
+        )
+    if isinstance(answer, list):
+        answer = "\n".join(
+            f"{m.get('role', 'assistant')}: {m.get('content', '')}" for m in answer
+        )
+    if not prompt or not answer:
         return ""
-    return f"### Question\n{q}\n### Answer\n{a}"
+    return f"Question: {prompt}\nAnswer: {answer}"
+
+
 
 
 def _fmt_mmlupro(row: Dict[str, Any]) -> str:
@@ -325,11 +335,11 @@ def main() -> None:
     s2_all += _take_n(ds_valley, tok, STAGE2_PER_SRC, _fmt_valley,
                       label="Valley-of-Reasoning")
 
-    # (c) BBH — 750 hard reasoning
-    print("  [2c] maveriq/bigbenchhard  (target: 750)")
-    ds_bbh = _stream_dataset("maveriq/bigbenchhard")
-    s2_all += _take_n(ds_bbh, tok, STAGE2_PER_SRC, _fmt_bbh,
-                      label="BBH")
+    # (c) Orca-Math — 750 math word problems for SymPy routing
+    print("  [2c] microsoft/orca-math-word-problems-200k  (target: 750)")
+    ds_orca = _stream_dataset("microsoft/orca-math-word-problems-200k")
+    s2_all += _take_n(ds_orca, tok, STAGE2_PER_SRC, _fmt_orca_math,
+                      label="Orca-Math")
 
     # (d) MMLU-Pro — 750 factual
     print("  [2d] TIGER-Lab/MMLU-Pro  (target: 750)")
