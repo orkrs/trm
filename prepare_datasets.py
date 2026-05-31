@@ -1,10 +1,7 @@
 """prepare_datasets.py — Stream, filter, and save datasets for TRM-Bank v3.0.
 
-Usage:
-    python prepare_datasets.py
-
-Requirements:
-    pip install datasets transformers tqdm
+All data is streamed (streaming=True) — nothing is fully downloaded.
+Only examples with <= 640 tokens (GPT-2 tokenizer) are kept.
 """
 
 from __future__ import annotations
@@ -296,7 +293,7 @@ def main() -> None:
     s2_all += _take_n(ds_glaive, tok, 150, _fmt_glaive,
                       label="glaive-code-assistant-v3")
 
-    # (b) Claude 4.6/4.7 Reasoning — 1100 logical reasoning examples (May 2026 SOTA)
+    # (b) Claude 4.6/4.7 Reasoning — 1000 logical reasoning examples
     print("  [2b] angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k  (target: 1000)")
     ds_claude = _stream_dataset("angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k", split="train")
     s2_all += _take_n(ds_claude, tok, 1000, _fmt_claude_reasoning,
