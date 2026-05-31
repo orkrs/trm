@@ -888,7 +888,7 @@ class TRMBankModel(nn.Module):
 
     def __init__(
         self,
-        pretrained_name: str = "state-spaces/mamba-2.8b",
+        pretrained_name: str = "state-spaces/mamba-1.4b-hf",
         mimo_rank: int = 4,
         d_state: int = 64,
         use_4bit: bool = True,

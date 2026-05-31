@@ -101,7 +101,7 @@ import torch
 
 @dataclass(frozen=True)
 class ModelConfig:
-    pretrained_model_name: str = "state-spaces/mamba-2.8b"
+    pretrained_model_name: str = "state-spaces/mamba-1.4b-hf"
     quantization_bits: int = 4
     quantization_type: str = "nf4"
     hidden_dim: int = 2560
@@ -793,7 +793,7 @@ class TRMBankModel(nn.Module):
     5. generate() с кастомным autoregressive loop (никогда не вызывает backbone.generate())
     """
     
-    def __init__(self, pretrained_name="state-spaces/mamba-2.8b", mimo_rank=4, d_state=64,
+    def __init__(self, pretrained_name="state-spaces/mamba-1.4b-hf", mimo_rank=4, d_state=64,
                  use_4bit=True, device=None, qrandlora_r=0, qrandlora_alpha=1.0,
                  qrandlora_sparsity=0.1, qrandlora_num_components=8,
                  qrandlora_target_modules=None):

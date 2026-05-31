@@ -41,7 +41,7 @@ import torch
 # Базовая модель: Mamba-2.8B в 4-bit NF4 квантизации.
 @dataclass(frozen=True)
 class ModelConfig:
-    pretrained_model_name: str = "state-spaces/mamba-2.8b-hf"
+    pretrained_model_name: str = "state-spaces/mamba-1.4b-hf"
     quantization_bits: int = 4
     quantization_type: str = "nf4"
     hidden_dim: int = 2560
@@ -424,7 +424,7 @@ def build_trainer_for_stage(stage_name, jsonl_path, device, config_overrides=Non
     if not sequences: raise RuntimeError(f"No sequences from {jsonl_path}")
     train_dataset = TruncatedBPTTDataset(sequences, cfg.truncation_length, cfg.max_seq_length)
     print("\n[2/5] Building TRMBankModel (Mamba-2.8B 4-bit)...")
-    model = TRMBankModel(pretrained_name="state-spaces/mamba-2.8b-hf", mimo_rank=CONFIG.mimo.mimo_rank,
+    model = TRMBankModel(pretrained_name="state-spaces/mamba-1.4b-hf", mimo_rank=CONFIG.mimo.mimo_rank,
         d_state=CONFIG.model.d_state, use_4bit=True, device=device, qrandlora_r=64,
         qrandlora_alpha=CONFIG.qrandlora.scaling_init, qrandlora_sparsity=CONFIG.qrandlora.sparsity,
         qrandlora_num_components=CONFIG.qrandlora.num_components, qrandlora_target_modules=CONFIG.qrandlora.target_modules)

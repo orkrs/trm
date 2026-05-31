@@ -197,7 +197,7 @@ def build_trainer_for_stage(
     # ---- 2. Build TRMBankModel ----
     print("\n[2/5] Building TRMBankModel (Mamba-2.8B 4-bit)...")
     model = TRMBankModel(
-        pretrained_name="state-spaces/mamba-2.8b-hf",
+        pretrained_name="state-spaces/mamba-1.4b-hf",
         mimo_rank=CONFIG.mimo.mimo_rank,
         d_state=CONFIG.model.d_state,
         use_4bit=True,

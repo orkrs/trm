@@ -6,7 +6,7 @@
 
 ## 1. Загрузка Mamba-2.8B (4-bit NF4)
 
-**ARTICLE.md:** Загружаем state-spaces/mamba-2.8b через bitsandbytes в 4-bit NF4.
+**ARTICLE.md:** Загружаем state-spaces/mamba-1.4b-hf через bitsandbytes в 4-bit NF4.
 
 **Код:** `core/complex_mimo_mamba.py:511-556`
 
@@ -14,7 +14,7 @@
 # Работает, но требует mamba_ssm + bitsandbytes
 # В Colab не встаёт — CUDA mismatch
 model = transformers.AutoModelForCausalLM.from_pretrained(
-    "state-spaces/mamba-2.8b",
+    "state-spaces/mamba-1.4b-hf",
     quantization_config=BitsAndBytesConfig(load_in_4bit=True, ...),
 )
 for param in model.parameters():  # заморозка
@@ -130,7 +130,7 @@ input_ids → Mamba-2.8B backbone (4-bit frozen)
 ```python
 from core import TRMBankModel
 
-model = TRMBankModel(pretrained_name="state-spaces/mamba-2.8b",
+model = TRMBankModel(pretrained_name="state-spaces/mamba-1.4b-hf",
                      mimo_rank=4, d_state=64)
 model.build()  # загружает Mamba-2.8B, замораживает, создаёт 64 скана
 
