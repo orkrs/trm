@@ -9,7 +9,7 @@ import torch
 
 @dataclass(frozen=True)
 class ModelConfig:
-    pretrained_model_name: str = "state-spaces/mamba-2.8b"
+    pretrained_model_name: str = "state-spaces/mamba-2.8b-hf"
     quantization_bits: int = 4
     quantization_type: str = "nf4"
     hidden_dim: int = 2560
