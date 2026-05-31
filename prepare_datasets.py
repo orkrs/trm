@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
+import time
 from typing import Any, Dict, List
 
 # ── constants ──────────────────────────────────────────────────────
@@ -34,6 +36,12 @@ STAGE1_CHAT  = 2_600
 STAGE2_TOTAL = 3_000
 STAGE2_PER_SRC = 750
 
+
+def _flush() -> None:
+    """Force flush stdout so Colab sees output immediately."""
+    sys.stdout.flush()
+
+
 # ── tokenizer ──────────────────────────────────────────────────────
 
 def _load_tokenizer() -> Any:
@@ -47,6 +55,7 @@ def _load_tokenizer() -> Any:
         print("  [WARN] Fallback to GPT-2 tokenizer")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    _flush()
     return tok
 
 
@@ -60,7 +69,12 @@ def _stream_dataset(name: str, split: str = "train",
                     streaming: bool = True) -> Any:
     """Stream a HuggingFace dataset."""
     from datasets import load_dataset
-    return load_dataset(name, split=split, streaming=streaming)
+    print(f"    [LOAD] Connecting to HuggingFace Hub ...", end=" ")
+    _flush()
+    ds = load_dataset(name, split=split, streaming=streaming)
+    print("done.")
+    _flush()
+    return ds
 
 
 def _take_n(stream: Any, tok: Any, n: int,
@@ -68,15 +82,34 @@ def _take_n(stream: Any, tok: Any, n: int,
     """Take exactly *n* examples from a stream that pass the token limit."""
     out: List[Dict[str, str]] = []
     scanned = 0
+    kept = 0
+    t0 = time.time()
+    print(f"    [SCAN] Starting iteration, looking for {n} examples (max {MAX_TOKENS} tokens) ...")
+    _flush()
+
     for row in stream:
         scanned += 1
         text = formatter(row)
         if text and _tok_len(text, tok) <= MAX_TOKENS:
             out.append({"text": text})
-            if len(out) % 100 == 0:
-                print(f"       Собрано {len(out)} / {n}  (просканировано {scanned} строк) ...")
+            kept += 1
+
+        # Progress every 100 collected or every 500 scanned
+        if kept > 0 and kept % 100 == 0:
+            elapsed = time.time() - t0
+            speed = scanned / elapsed if elapsed > 0 else 0
+            print(f"    [SCAN] Collected {kept}/{n}  |  scanned {scanned} rows  |  "
+                  f"keep ratio {kept/scanned:.1%}  |  {speed:.0f} rows/s  |  "
+                  f"{elapsed:.0f}s elapsed")
+            _flush()
+
         if len(out) >= n:
             break
+
+    elapsed = time.time() - t0
+    print(f"    [DONE] {label}: {len(out)} kept / {scanned} scanned  "
+          f"({elapsed:.1f}s)")
+    _flush()
     return out
 
 
@@ -173,89 +206,94 @@ def _shuffle_and_save(data: List[Dict[str, str]], path: str,
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
     print(f"  {label}: {len(data)} examples -> {path}")
+    _flush()
 
 
 def main() -> None:
+    t_total = time.time()
     print("=" * 60)
     print("TRM-Bank v3.0 — Dataset Preparation (streaming)")
     print("=" * 60)
+    _flush()
 
     tok = _load_tokenizer()
 
     # ── Stage 1 ────────────────────────────────────────────────────
+    t_stage = time.time()
     print("\n--- Stage 1: QRandLoRA Pretraining (6 500 examples) ---")
-
-    s1_math: List[Dict[str, str]] = []
+    _flush()
 
     # (a) NuminaMath-CoT — 3 900 math CoT examples
-    print("  [1a] Streaming AI-MO/NuminaMath-CoT ...")
+    print("  [1a] AI-MO/NuminaMath-CoT  (target: 3 900)")
     ds_numina = _stream_dataset("AI-MO/NuminaMath-CoT")
-    s1_math += _take_n(ds_numina, tok, STAGE1_MATH, _fmt_numina)
-    print(f"       Got {len(s1_math)} / {STAGE1_MATH} math examples")
+    s1_math = _take_n(ds_numina, tok, STAGE1_MATH, _fmt_numina,
+                      label="NuminaMath-CoT")
 
     # (b) Magpie-Ultra — 1 300 dialogue examples
-    print("  [1b] Streaming argilla/magpie-ultra-v1.0 ...")
+    print("  [1b] argilla/magpie-ultra-v1.0  (target: 1 300)")
     ds_magpie = _stream_dataset("argilla/magpie-ultra-v1.0")
-    s1_chat: List[Dict[str, str]] = []
-    s1_chat += _take_n(ds_magpie, tok, STAGE1_CHAT // 2, _fmt_magpie)
-    print(f"       Got {len(s1_chat)} from Magpie")
+    s1_chat = _take_n(ds_magpie, tok, STAGE1_CHAT // 2, _fmt_magpie,
+                      label="Magpie-Ultra")
 
     # (c) ShareGPT-Cleaned — 1 300 dialogue examples
-    print("  [1c] Streaming Vtuber-plan/sharegpt-cleaned ...")
+    print("  [1c] Vtuber-plan/sharegpt-cleaned  (target: 1 300)")
     ds_sg = _stream_dataset("Vtuber-plan/sharegpt-cleaned")
-    s1_chat += _take_n(ds_sg, tok, STAGE1_CHAT - len(s1_chat), _fmt_sharegpt)
-    print(f"       Got {len(s1_chat)} / {STAGE1_CHAT} chat examples")
+    s1_chat += _take_n(ds_sg, tok, STAGE1_CHAT - len(s1_chat),
+                       _fmt_sharegpt, label="ShareGPT-Cleaned")
 
     s1_all = s1_math + s1_chat
     random.shuffle(s1_all)
     _shuffle_and_save(s1_all, os.path.join(DATA_DIR,
                        "stage1_qrandlora.jsonl"), "Stage 1")
+    print(f"  Stage 1 done in {time.time() - t_stage:.0f}s")
 
     # ── Stage 2 ────────────────────────────────────────────────────
+    t_stage = time.time()
     print("\n--- Stage 2: Router + LPRM Tuning (3 000 examples) ---")
+    _flush()
 
     s2_all: List[Dict[str, str]] = []
 
     # (a) LiveCodeBench — 750 code generation
-    print("  [2a] Streaming livecodebench/code_generation_lite ...")
+    print("  [2a] livecodebench/code_generation_lite  (target: 750)")
     ds_lcb = _stream_dataset("livecodebench/code_generation_lite")
-    s2_all += _take_n(ds_lcb, tok, STAGE2_PER_SRC, _fmt_livecodebench)
-    print(f"       Got {len(s2_all)} / {STAGE2_PER_SRC}")
+    s2_all += _take_n(ds_lcb, tok, STAGE2_PER_SRC, _fmt_livecodebench,
+                      label="LiveCodeBench")
 
     # (b) MuSR — 750 multi-step reasoning
-    print("  [2b] Streaming TAUR-Lab/MuSR ...")
+    print("  [2b] TAUR-Lab/MuSR  (target: 750)")
     ds_musr = _stream_dataset("TAUR-Lab/MuSR")
-    before = len(s2_all)
-    s2_all += _take_n(ds_musr, tok, STAGE2_PER_SRC,
-                      _fmt_musr)
-    print(f"       Got {len(s2_all) - before} / {STAGE2_PER_SRC}")
+    s2_all += _take_n(ds_musr, tok, STAGE2_PER_SRC, _fmt_musr,
+                      label="MuSR")
 
     # (c) BBH — 750 hard reasoning
-    print("  [2c] Streaming lukaemon/bbh ...")
+    print("  [2c] lukaemon/bbh  (target: 750)")
     ds_bbh = _stream_dataset("lukaemon/bbh")
-    before = len(s2_all)
-    s2_all += _take_n(ds_bbh, tok, STAGE2_PER_SRC, _fmt_bbh)
-    print(f"       Got {len(s2_all) - before} / {STAGE2_PER_SRC}")
+    s2_all += _take_n(ds_bbh, tok, STAGE2_PER_SRC, _fmt_bbh,
+                      label="BBH")
 
     # (d) MMLU-Pro — 750 factual
-    print("  [2d] Streaming TIGER-Lab/MMLU-Pro ...")
+    print("  [2d] TIGER-Lab/MMLU-Pro  (target: 750)")
     ds_mmlu = _stream_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    before = len(s2_all)
-    s2_all += _take_n(ds_mmlu, tok, STAGE2_PER_SRC, _fmt_mmlupro)
-    print(f"       Got {len(s2_all) - before} / {STAGE2_PER_SRC}")
+    s2_all += _take_n(ds_mmlu, tok, STAGE2_PER_SRC, _fmt_mmlupro,
+                      label="MMLU-Pro")
 
     random.shuffle(s2_all)
     _shuffle_and_save(s2_all, os.path.join(DATA_DIR,
                        "stage2_router.jsonl"), "Stage 2")
+    print(f"  Stage 2 done in {time.time() - t_stage:.0f}s")
 
     # ── Summary ────────────────────────────────────────────────────
+    elapsed = time.time() - t_total
     print("\n" + "=" * 60)
     print("Done.")
-    print(f"  Stage 1: {STAGE1_TOTAL} examples -> "
+    print(f"  Stage 1: {len(s1_all)} examples -> "
           f"{os.path.join(DATA_DIR, 'stage1_qrandlora.jsonl')}")
-    print(f"  Stage 2: {STAGE2_TOTAL} examples -> "
+    print(f"  Stage 2: {len(s2_all)} examples -> "
           f"{os.path.join(DATA_DIR, 'stage2_router.jsonl')}")
+    print(f"  Total time: {elapsed:.0f}s ({elapsed/60:.1f} min)")
     print("=" * 60)
+    _flush()
 
 
 if __name__ == "__main__":
