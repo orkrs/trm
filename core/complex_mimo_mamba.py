@@ -960,7 +960,7 @@ class TRMBankModel(nn.Module):
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 self.pretrained_name,
                 quantization_config=quantization_config,
-                device_map="auto" if self._device is None else None,
+                device_map="auto",
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
             )
@@ -1021,7 +1021,9 @@ class TRMBankModel(nn.Module):
 
         self._qr_patched_count = self._apply_qrandlora()
 
-        if self._device is not None:
+        # 4-bit models are already on the correct device via device_map="auto".
+        # Only move non-quantized models explicitly.
+        if not self.use_4bit and self._device is not None:
             self.backbone = self.backbone.to(self._device)
 
     @torch.no_grad()

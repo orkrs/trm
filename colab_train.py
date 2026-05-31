@@ -209,7 +209,7 @@ def build_trainer_for_stage(
         qrandlora_target_modules=CONFIG.qrandlora.target_modules,
     )
     model.build()
-    model = model.to(device)
+    # 4-bit model is already on GPU via device_map="auto".
     model.train()
     print(f"  Hidden dim: {model.hidden_dim}, Layers: {model.num_layers}")
     print(f"  QRandLoRA patched: {model._qr_patched_count} layers")
