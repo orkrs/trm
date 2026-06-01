@@ -34,7 +34,7 @@ from loguru import logger
 STAGE1_OVERRIDES: Dict[str, Any] = {
     "batch_size": 1,
     "gradient_accumulation_steps": 8,
-    "truncation_length": 256,
+    "truncation_length": 128,
     "learning_rate": 3e-4,
     "warmup_steps": 30,
     "max_steps": 500,
@@ -215,7 +215,7 @@ def build_trainer_for_stage(
         qrandlora_sparsity=CONFIG.qrandlora.sparsity,
         qrandlora_num_components=CONFIG.qrandlora.num_components,
         qrandlora_target_modules=CONFIG.qrandlora.target_modules,
-        cpu_offload_in_proj=False,
+        cpu_offload_in_proj=True,
     )
     model.build()
     model.train()
