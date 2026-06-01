@@ -239,7 +239,7 @@ def patch_mamba2_with_mamba3(
 
     # Auto-decide CPU offload once
     if cpu_offload_in_proj is None and torch.cuda.is_available():
-        per_gpu_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        per_gpu_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         cpu_offload_in_proj = per_gpu_gb < 18.0
     elif cpu_offload_in_proj is None:
         cpu_offload_in_proj = True

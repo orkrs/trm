@@ -68,7 +68,7 @@ def check_gpus() -> None:
     print(f"[OK] {n} GPU(s) detected:")
     for i in range(n):
         props = torch.cuda.get_device_properties(i)
-        print(f"  [{i}] {props.name} ({props.total_mem / 1024**3:.1f} GB)")
+        print(f"  [{i}] {props.name} ({props.total_memory / 1024**3:.1f} GB)")
 
 
 def _load_tokenizer() -> Any:
