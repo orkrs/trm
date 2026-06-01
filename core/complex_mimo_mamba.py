@@ -1200,6 +1200,8 @@ class TRMBankModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         return_branches: bool = False,
+        return_states: bool = False,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Forward pass through the patched TRM-Bank backbone.
 
@@ -1240,6 +1242,8 @@ class TRMBankModel(nn.Module):
             "logits": logits,
             "hidden_states": outputs.hidden_states,
         }
+        if return_states:
+            result["states"] = None
         return result
 
     @torch.no_grad()

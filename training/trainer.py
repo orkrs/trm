@@ -155,7 +155,12 @@ class TRMBankTrainer:
 
         # With DDP (accelerate), avoid PagedAdamW (it has device_map issues).
         # With device_map="auto" (single-process), PagedAdamW is OK on 1 GPU.
-        has_ddp = self.accelerator is not None and torch.cuda.device_count() > 1
+        # In accelerate multi-process mode, each process sees 1 GPU even with DDP,
+        # so check accelerator.num_processes instead of torch.cuda.device_count().
+        has_ddp = (
+            self.accelerator is not None
+            and getattr(self.accelerator, "num_processes", 1) > 1
+        )
         use_paged: bool = (
             PagedAdamW is not None
             and torch.cuda.is_available()

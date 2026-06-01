@@ -163,10 +163,13 @@ class QRandLoRALayer(nn.Module):
             Output tensor of shape (..., out_features).
         """
         # A: (n, r, d_in), B: (n, d_out, r)
-        A = self.A_frozen.to(x.dtype)
-        B = self.B_frozen.to(x.dtype)
-        L = self.Lambda     # (n, r)
-        G = self.Gamma      # (n, r)
+        # Ensure all buffers are on the same device as input to prevent
+        # device mismatch during distributed training.
+        target_dev = x.device
+        A = self.A_frozen.to(target_dev).to(x.dtype)
+        B = self.B_frozen.to(target_dev).to(x.dtype)
+        L = self.Lambda.to(target_dev)   # (n, r)
+        G = self.Gamma.to(target_dev)    # (n, r)
 
         # For each component j:
         #   h = A_j @ (Gamma_j * x)  -- wait, A_j maps d_in -> r
@@ -298,10 +301,12 @@ class QRandLoRALinear(nn.Module):
         Returns:
             LoRA additive update of shape (..., out_features).
         """
-        A = self.qrandlora.A_frozen.to(x.dtype)     # (n, r, d_in)
-        B = self.qrandlora.B_frozen.to(x.dtype)     # (n, d_out, r)
-        L = self.qrandlora.Lambda                    # (n, r)
-        G = self.qrandlora.Gamma                     # (n, r)
+        # Ensure all LoRA parameters are on the same device as input.
+        target_dev = x.device
+        A = self.qrandlora.A_frozen.to(target_dev).to(x.dtype)   # (n, r, d_in)
+        B = self.qrandlora.B_frozen.to(target_dev).to(x.dtype)   # (n, d_out, r)
+        L = self.qrandlora.Lambda.to(target_dev)                  # (n, r)
+        G = self.qrandlora.Gamma.to(target_dev)                   # (n, r)
 
         h = torch.einsum("n r i, ... i -> ... n r", A, x)
         # h: (..., n, r) -> A_j @ x for each component j
@@ -366,10 +371,11 @@ class QRandLoRALinear4bit(nn.Module):
 
     def _apply_lora(self, x: torch.Tensor) -> torch.Tensor:
         """Apply QRandLoRA adaptation to input."""
-        A = self.qrandlora.A_frozen.to(x.dtype)     # (n, r, d_in)
-        B = self.qrandlora.B_frozen.to(x.dtype)     # (n, d_out, r)
-        L = self.qrandlora.Lambda                    # (n, r)
-        G = self.qrandlora.Gamma                     # (n, r)
+        target_dev = x.device
+        A = self.qrandlora.A_frozen.to(target_dev).to(x.dtype)   # (n, r, d_in)
+        B = self.qrandlora.B_frozen.to(target_dev).to(x.dtype)   # (n, d_out, r)
+        L = self.qrandlora.Lambda.to(target_dev)                  # (n, r)
+        G = self.qrandlora.Gamma.to(target_dev)                   # (n, r)
 
         h = torch.einsum("n r i, ... i -> ... n r", A, x)
         h = h * L * G
@@ -417,6 +423,7 @@ def apply_qrandlora(
 
         if (is_linear or is_bnb_linear) and any(t in name for t in target_modules):
             if is_bnb_linear:
+                target_device = child.weight.device
                 wrapper = QRandLoRALinear4bit(
                     base_layer=child,
                     num_components=num_components,
@@ -424,8 +431,9 @@ def apply_qrandlora(
                     sparsity=sparsity,
                     alpha=alpha,
                 )
+                wrapper = wrapper.to(target_device)
             else:
-                device: torch.device = child.weight.device
+                target_device = child.weight.device
                 dtype: torch.dtype = child.weight.dtype
                 wrapper = QRandLoRALinear(
                     base_weight=child.weight.data,
@@ -437,6 +445,7 @@ def apply_qrandlora(
                     device=device,
                     dtype=dtype,
                 )
+                wrapper = wrapper.to(target_device)
             setattr(model, name, wrapper)
             logger.info(
                 f"QRandLoRA applied: {full_name} "

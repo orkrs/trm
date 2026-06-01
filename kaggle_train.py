@@ -254,6 +254,9 @@ def build_trainer_for_stage(
     accelerator.print("  Pipeline attached: memory + router + LPRM")
 
     # ---- 5. Trainer ----
+    # Order: model.build() already loaded + patched + QRandLoRA-applied the model.
+    # LPRM and model are on CPU; accelerator.prepare() inside TRMBankTrainer.__init__
+    # will handle DDP wrapping and GPU placement.
     accelerator.print(f"\n[5/5] Initialising TRMBankTrainer...")
     trainer = TRMBankTrainer(
         model=model,
