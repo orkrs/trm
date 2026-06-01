@@ -12,6 +12,7 @@ head and game-theoretic router, and runs truncated-BPTT training.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -27,9 +28,9 @@ from loguru import logger
 # ------------------------------------------------------------------
 
 STAGE1_OVERRIDES: Dict[str, Any] = {
-    "batch_size": 2,
+    "batch_size": 1,
     "gradient_accumulation_steps": 8,
-    "truncation_length": 256,
+    "truncation_length": 128,
     "learning_rate": 3e-4,
     "warmup_steps": 30,
     "max_steps": 500,
@@ -38,8 +39,9 @@ STAGE1_OVERRIDES: Dict[str, Any] = {
     "eval_every_n_steps": 250,
     "save_every_n_steps": 250,
     "output_dir": "./outputs_colab",
-    "max_seq_length": 1024,
+    "max_seq_length": 512,
     "lprm_weight": 0.1,
+    "gradient_checkpointing": True,
 }
 
 STAGE2_OVERRIDES: Dict[str, Any] = {
@@ -211,6 +213,8 @@ def build_trainer_for_stage(
     model.build()
     # 4-bit model is already on GPU via device_map="auto".
     model.train()
+    gc.collect()
+    torch.cuda.empty_cache()
     print(f"  Hidden dim: {model.hidden_dim}, Layers: {model.num_layers}")
     print(f"  QRandLoRA patched: {model._qr_patched_count} layers")
 

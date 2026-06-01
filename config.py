@@ -104,6 +104,7 @@ class TrainingConfig:
     save_every_n_steps: int = 1000
     output_dir: str = "./outputs"
     lprm_weight: float = 0.1
+    gradient_checkpointing: bool = False
     replay_capacity: int = 10000
     replay_frequency: int = 50
     replay_batch_size: int = 16

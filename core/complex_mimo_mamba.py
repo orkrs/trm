@@ -338,6 +338,7 @@ class ComplexMIMOMamba3(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         precomputed_projections: bool = False,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -349,6 +350,7 @@ class ComplexMIMOMamba3(nn.Module):
         self.headdim: int = headdim
         self.mimo_rank: int = mimo_rank
         self.precomputed_projections: bool = precomputed_projections
+        self.gradient_checkpointing: bool = gradient_checkpointing
 
         # SSM dimension = d_model (no expand factor for direct Mamba-3 style)
         d_in: int = d_model
@@ -391,6 +393,87 @@ class ComplexMIMOMamba3(nn.Module):
         if not precomputed_projections:
             self.out_proj = nn.Linear(d_in, d_model, **factory)
             self.norm = nn.LayerNorm(d_model, **factory)
+
+    @staticmethod
+    def _scan_impl(
+        x_ssm: torch.Tensor,
+        h: torch.Tensor,
+        cos_all: torch.Tensor,
+        sin_all: torch.Tensor,
+        dt_vals: torch.Tensor,
+        A_vals: torch.Tensor,
+        trap_vals: torch.Tensor,
+        B_proj_vals: torch.Tensor,
+        C_proj_vals: torch.Tensor,
+        z_vals: torch.Tensor,
+        D_head: torch.Tensor,
+        N: int,
+        R: int,
+        H: int,
+        G: int,
+        headdim: int,
+        precomputed: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D = x_ssm.shape
+        outputs: List[torch.Tensor] = []
+        prev_inp: Optional[torch.Tensor] = None
+
+        for t_idx in range(L):
+            x_t = x_ssm[:, t_idx, :]
+            cos_t = cos_all[:, t_idx, :, :]
+            sin_t = sin_all[:, t_idx, :, :]
+            dt_t = dt_vals[:, t_idx, :]
+            A_t = A_vals[:, t_idx, :, :]
+            trap_t = trap_vals[:, t_idx, :]
+            B_t = B_proj_vals[:, t_idx, :, :, :]
+            C_t = C_proj_vals[:, t_idx, :, :, :]
+
+            A_t_exp = A_t.unsqueeze(1).expand(-1, G, -1, -1)
+            A_t_exp = rearrange(A_t_exp, "b g h n -> b (g h) n")
+            dt_t_exp = dt_t.unsqueeze(1).expand(-1, G, -1)
+            dt_t_exp = rearrange(dt_t_exp, "b g h -> b (g h)")
+
+            if prev_inp is not None:
+                prev_rot = _rotate_head_grouped(prev_inp, cos_t, sin_t, nheads=H)
+                decay_prev = torch.exp(A_t_exp * dt_t_exp.unsqueeze(-1))
+                prev_inp_weighted = prev_rot * decay_prev
+            else:
+                prev_inp_weighted = torch.zeros_like(h)
+
+            B_t_exp = B_t.unsqueeze(1).expand(-1, G, -1, -1, -1)
+            B_t_exp = rearrange(B_t_exp, "b g h n r -> b (g h) n r")
+            curr_inp = B_t_exp * x_t.unsqueeze(-1).unsqueeze(-1)
+            curr_inp = curr_inp.sum(dim=-1)
+
+            h_rot = _rotate_head_grouped(h, cos_t, sin_t, nheads=H)
+            decay = torch.exp(A_t_exp * dt_t_exp.unsqueeze(-1))
+
+            trap_channel = trap_t.unsqueeze(1).expand(-1, G, -1)
+            trap_channel = rearrange(trap_channel, "b g h -> b (g h)")
+
+            h = (
+                decay * h_rot
+                + (1.0 - trap_channel.unsqueeze(-1)) * dt_t_exp.unsqueeze(-1) * prev_inp_weighted
+                + trap_channel.unsqueeze(-1) * dt_t_exp.unsqueeze(-1) * curr_inp
+            )
+
+            prev_inp = curr_inp.clone()
+
+            C_t_exp = C_t.unsqueeze(1).expand(-1, G, -1, -1, -1)
+            C_t_exp = rearrange(C_t_exp, "b g h r n -> b (g h) r n")
+            y_t = torch.einsum("b d r n, b d n -> b d r", C_t_exp, h)
+
+            D_exp = D_head.unsqueeze(0).unsqueeze(1).expand(-1, G, -1)
+            D_exp = rearrange(D_exp, "b g h -> b (g h)")
+            y_t = y_t + D_exp.unsqueeze(-1) * x_t.unsqueeze(-1)
+
+            if not precomputed:
+                z_t = z_vals[:, t_idx, :]
+                y_t = y_t * F.silu(z_t).unsqueeze(-1)
+
+            outputs.append(y_t)
+
+        return torch.stack(outputs, dim=1), h.detach()
 
     def forward(
         self,
@@ -487,95 +570,21 @@ class ComplexMIMOMamba3(nn.Module):
 
         cos_all = torch.cos(angles)
         sin_all = torch.sin(angles)
-        # cos/sin_all: (B, L, H, N/2) -> broadcast over D_in channels
 
-        outputs_list: List[torch.Tensor] = []
-        prev_inp: Optional[torch.Tensor] = None
-
-        for t_idx in range(L):
-            x_t = x_ssm[:, t_idx, :]               # (B, D)
-            dt_t = dt[:, t_idx, :]                  # (B, H)
-            A_t = A[:, t_idx, :, :]                 # (B, H, N)
-            trap_t = trap[:, t_idx, :]              # (B, H)
-            cos_t = cos_all[:, t_idx, :, :]         # (B, H, N/2)
-            sin_t = sin_all[:, t_idx, :, :]         # (B, H, N/2)
-            B_t = B_proj[:, t_idx, :, :, :]         # (B, H, N, R)
-            C_t = C_proj[:, t_idx, :, :, :]         # (B, H, R, N)
-
-            # ---- Expand per-head params to per-channel ----
-            # A_t: (B, H, N) -> (B, D, N)
-            A_t_exp = A_t.unsqueeze(1).expand(-1, D // H, -1, -1)
-            A_t_exp = rearrange(A_t_exp, "b g h n -> b (g h) n")
-            # dt_t: (B, H) -> (B, D)
-            dt_t_exp = dt_t.unsqueeze(1).expand(-1, D // H, -1)
-            dt_t_exp = rearrange(dt_t_exp, "b g h -> b (g h)")
-
-            # ---- Trapezoidal previous input ----
-            if prev_inp is not None:
-                prev_rot = _rotate_head_grouped(prev_inp, cos_t, sin_t, nheads=H)
-                # prev_rot: (B, D, N)
-                decay_prev = torch.exp(A_t_exp * dt_t_exp.unsqueeze(-1))
-                prev_inp_weighted = prev_rot * decay_prev
-            else:
-                prev_inp_weighted = torch.zeros_like(h)
-
-            # ---- Current input via MIMO branches ----
-            # Each channel: inp = sum_r B_t[r] @ x_t  where B_t[r] is (N,) scalar
-            # B_t: (B, H, N, R), x_t: (B, D)
-            # Expand B_t to channels: (B, H, N, R) -> (B, D//H, H, N, R) -> (B, D, N, R)
-            B_t_exp = B_t.unsqueeze(1).expand(-1, D // H, -1, -1, -1)
-            B_t_exp = rearrange(B_t_exp, "b g h n r -> b (g h) n r")
-            # B_t_exp: (B, D, N, R)
-
-            # x_t: (B, D) -> (B, D, 1, 1) for broadcasting
-            curr_inp = B_t_exp * x_t.unsqueeze(-1).unsqueeze(-1)
-            # curr_inp: (B, D, N, R)
-            curr_inp = curr_inp.sum(dim=-1)
-            # curr_inp: (B, D, N) -- state update summed over MIMO branches
-
-            # ---- State update ----
-            h_rot = _rotate_head_grouped(h, cos_t, sin_t, nheads=H)
-            # h_rot: (B, D, N)
-
-            decay = torch.exp(A_t_exp * dt_t_exp.unsqueeze(-1))
-
-            trap_channel = trap_t.unsqueeze(1).expand(-1, D // H, -1)
-            trap_channel = rearrange(trap_channel, "b g h -> b (g h)")
-
-            h = (
-                decay * h_rot
-                + (1.0 - trap_channel.unsqueeze(-1)) * dt_t_exp.unsqueeze(-1) * prev_inp_weighted
-                + trap_channel.unsqueeze(-1) * dt_t_exp.unsqueeze(-1) * curr_inp
+        if self.gradient_checkpointing and self.training:
+            y, h = torch.utils.checkpoint.checkpoint(
+                self._scan_impl,
+                x_ssm, h, cos_all, sin_all, dt, A, trap, B_proj, C_proj,
+                z if not self.precomputed_projections else z,
+                self.D, N, R, H, G, headdim_actual, self.precomputed_projections,
+                use_reentrant=False,
             )
-            # h: (B, D, N)
-
-            # Store current input for next trapezoidal step
-            prev_inp = curr_inp.clone()
-
-            # ---- MIMO output ----
-            # C_t: (B, H, R, N) -> expand to (B, D, R, N)
-            C_t_exp = C_t.unsqueeze(1).expand(-1, D // H, -1, -1, -1)
-            C_t_exp = rearrange(C_t_exp, "b g h r n -> b (g h) r n")
-            # C_t_exp: (B, D, R, N)
-
-            # y = C_t @ h -> (B, D, R)
-            y_t = torch.einsum("b d r n, b d n -> b d r", C_t_exp, h)
-            # y_t: (B, D, R)
-
-            # Skip connection: D * x_t
-            D_exp = self.D.unsqueeze(0).unsqueeze(1).expand(-1, D // H, -1)
-            D_exp = rearrange(D_exp, "b g h -> b (g h)")
-            y_t = y_t + D_exp.unsqueeze(-1) * x_t.unsqueeze(-1)
-
-            # Gate with z: y *= SiLU(z)  (broadcast z over branches)
-            if not self.precomputed_projections:
-                z_t = z[:, t_idx, :]                     # (B, D)
-                y_t = y_t * F.silu(z_t).unsqueeze(-1)
-            # y_t: (B, D, R)
-
-            outputs_list.append(y_t)
-
-        y = torch.stack(outputs_list, dim=1)
+        else:
+            y, h = self._scan_impl(
+                x_ssm, h, cos_all, sin_all, dt, A, trap, B_proj, C_proj,
+                z if not self.precomputed_projections else z,
+                self.D, N, R, H, G, headdim_actual, self.precomputed_projections,
+            )
         # y: (B, L, D, R)
 
         branches_out: Optional[torch.Tensor] = y if return_branches else None
@@ -1042,6 +1051,7 @@ class TRMBankModel(nn.Module):
             mimo_rank=self.mimo_rank,
             device=self._device,
             dtype=torch.bfloat16,
+            gradient_checkpointing=True,
         )
 
         self._qr_patched_count = self._apply_qrandlora()

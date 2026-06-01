@@ -42,6 +42,7 @@ class Mamba3MixerAdapter(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         orig_mixer: Optional[nn.Module] = None,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -88,6 +89,7 @@ class Mamba3MixerAdapter(nn.Module):
             device=device,
             dtype=dtype,
             precomputed_projections=True,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
     def forward(
@@ -186,6 +188,7 @@ def patch_mamba2_with_mamba3(
     mimo_rank: int = 2,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
+    gradient_checkpointing: bool = False,
 ) -> int:
     """Replace every ``MambaBlock.mixer`` with ``Mamba3MixerAdapter``.
 
@@ -235,6 +238,7 @@ def patch_mamba2_with_mamba3(
             d_state=d_state, headdim=headdim, mimo_rank=mimo_rank,
             device=device, dtype=dtype,
             orig_mixer=orig_mixer,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
         child.mixer = adapter

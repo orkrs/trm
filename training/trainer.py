@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -12,6 +13,11 @@ from tqdm import tqdm
 
 from config import CONFIG, TrainingConfig
 from memory.hierarchical_memory import HierarchicalMemory
+
+try:
+    from bitsandbytes.optim import PagedAdamW
+except ImportError:
+    PagedAdamW = None  # fallback defined in __init__
 
 
 class TruncatedBPTTDataset(IterableDataset):
@@ -120,11 +126,21 @@ class TRMBankTrainer:
         if not trainable_params:
             logger.warning("No trainable parameters found. Check requires_grad flags.")
 
-        self.optimizer = torch.optim.AdamW(
+        use_paged: bool = (
+            PagedAdamW is not None
+            and torch.cuda.is_available()
+            and next(self.model.parameters()).is_cuda
+        )
+        optim_cls = PagedAdamW if use_paged else torch.optim.AdamW
+        self.optimizer = optim_cls(
             trainable_params,
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
+        if use_paged:
+            logger.info("Using PagedAdamW optimizer (CPU-offloaded Adam states).")
+        else:
+            logger.info("Using standard AdamW optimizer.")
 
         # Linear warmup + cosine decay scheduler.
         total_steps = config.num_epochs * (
@@ -302,6 +318,7 @@ class TRMBankTrainer:
         )
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="chunk")
+        amp_enabled: bool = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
         for batch in pbar:
             input_ids = batch["input_ids"]             # (1, L_chunk)
             labels = batch["labels"]                   # (1, L_chunk)
@@ -316,24 +333,25 @@ class TRMBankTrainer:
 
             # Try return_states; some models (e.g. TinyTRMModel) support it.
             # If the model doesn't accept it, catch TypeError.
-            try:
-                outputs = self.model(return_states=True, **kwargs)
-                states = outputs.get("states", None)
-            except TypeError:
-                outputs = self.model(**kwargs)
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                try:
+                    outputs = self.model(return_states=True, **kwargs)
+                    states = outputs.get("states", None)
+                except TypeError:
+                    outputs = self.model(**kwargs)
 
-            logits = outputs["logits"]
-            hidden_states = outputs.get("hidden_states", None)
+                logits = outputs["logits"]
+                hidden_states = outputs.get("hidden_states", None)
 
-            # Language modelling loss.
-            lm_loss = self._compute_loss(logits, labels)
-            loss = lm_loss / self.config.gradient_accumulation_steps
+                # Language modelling loss.
+                lm_loss = self._compute_loss(logits, labels)
+                loss = lm_loss / self.config.gradient_accumulation_steps
 
-            # LPRM auxiliary loss (teaches heads to predict model confidence).
-            if self.lprm is not None and hidden_states is not None:
-                lprm_loss = self._compute_lprm_loss(logits, labels, hidden_states)
-                loss = loss + (self.config.lprm_weight * lprm_loss)
-                total_lprm_loss += lprm_loss.item()
+                # LPRM auxiliary loss (teaches heads to predict model confidence).
+                if self.lprm is not None and hidden_states is not None:
+                    lprm_loss = self._compute_lprm_loss(logits, labels, hidden_states)
+                    loss = loss + (self.config.lprm_weight * lprm_loss)
+                    total_lprm_loss += lprm_loss.item()
 
             loss.backward()
 
@@ -356,6 +374,10 @@ class TRMBankTrainer:
                 if max_steps_remaining > 0 and self.global_step >= max_steps_remaining:
                     logger.info(f"Reached max_steps={max_steps_remaining}, stopping early.")
                     break
+
+                if self.global_step % 50 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
             # Logging.
             if self.global_step % self.config.log_every_n_steps == 0 and num_batches > 0:
