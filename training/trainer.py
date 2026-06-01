@@ -83,7 +83,6 @@ class TruncatedBPTTDataset(IterableDataset):
                 yield {
                     "input_ids": chunk.unsqueeze(0),
                     "labels": chunk.unsqueeze(0),
-                    "segment_start": torch.tensor(start, dtype=torch.long),
                     "is_last": torch.tensor(end >= len(seq), dtype=torch.bool),
                 }
 

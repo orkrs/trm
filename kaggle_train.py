@@ -276,9 +276,11 @@ def build_trainer_for_stage(
 
 
 def main() -> None:
-    from accelerate import Accelerator
+    from accelerate import Accelerator, DataLoaderConfiguration
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
+    )
 
     accelerator.print("=" * 60)
     accelerator.print("TRM-Bank v3.0 — Kaggle Training (2xT4, DDP via accelerate)")
