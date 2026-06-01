@@ -15,6 +15,11 @@ from config import CONFIG, TrainingConfig
 from memory.hierarchical_memory import HierarchicalMemory
 
 try:
+    from accelerate import Accelerator
+except ImportError:
+    Accelerator = None  # type: ignore[assignment,misc]
+
+try:
     from bitsandbytes.optim import PagedAdamW
 except ImportError:
     PagedAdamW = None  # fallback defined in __init__
@@ -28,11 +33,17 @@ class TruncatedBPTTDataset(IterableDataset):
     training loop can carry hidden state across chunks and detach
     at segment boundaries.
 
+    Supports DDP sharding: when ``world_size > 1``, each rank sees
+    a disjoint subset of sequences (round-robin).  This ensures
+    each GPU processes different data during distributed training.
+
     Args:
         data: List of tokenized sequences (variable length).
         truncation_length: Maximum tokens per chunk.
         seq_length: Maximum total sequence length (sequences longer
                     than this are split into separate items).
+        rank: DDP rank (0-indexed).  ``0`` means no sharding.
+        world_size: Total number of DDP processes.  ``1`` means no sharding.
     """
 
     def __init__(
@@ -40,15 +51,25 @@ class TruncatedBPTTDataset(IterableDataset):
         data: List[torch.Tensor],
         truncation_length: int = 2048,
         seq_length: int = 8192,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         super().__init__()
         self.data: List[torch.Tensor] = data
         self.truncation_length: int = truncation_length
         self.seq_length: int = seq_length
+        self.rank: int = rank
+        self.world_size: int = world_size
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
         data = self.data
+
+        # DDP sharding: each rank gets a disjoint subset.
+        if self.world_size > 1:
+            data = data[self.rank::self.world_size]
+
+        # DataLoader worker sharding: each worker gets a subset of the rank's data.
         if worker_info is not None:
             data = data[worker_info.id::worker_info.num_workers]
 
@@ -68,7 +89,10 @@ class TruncatedBPTTDataset(IterableDataset):
 
     def __len__(self) -> int:
         total = 0
-        for seq in self.data:
+        data = self.data
+        if self.world_size > 1:
+            data = data[self.rank::self.world_size]
+        for seq in data:
             total += max(1, (min(len(seq), self.seq_length) + self.truncation_length - 1)
                          // self.truncation_length)
         return total
@@ -103,6 +127,7 @@ class TRMBankTrainer:
         train_dataset: Optional[IterableDataset] = None,
         eval_dataset: Optional[IterableDataset] = None,
         memory: Optional[HierarchicalMemory] = None,
+        accelerator: Optional[Any] = None,
     ) -> None:
         self.model: nn.Module = model
         self.lprm: Optional[nn.Module] = lprm
@@ -110,13 +135,15 @@ class TRMBankTrainer:
         self.train_dataset: Optional[IterableDataset] = train_dataset
         self.eval_dataset: Optional[IterableDataset] = eval_dataset
         self.memory: Optional[HierarchicalMemory] = memory
+        self.accelerator: Optional[Any] = accelerator
 
         # Collect trainable parameters (QRandLoRA + LPRM only).
         trainable_params: List[torch.Tensor] = []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 trainable_params.append(param)
-                logger.debug(f"Trainable param: {name}, shape={param.shape}")
+                if self._is_main_process:
+                    logger.debug(f"Trainable param: {name}, shape={param.shape}")
 
         if self.lprm is not None:
             trainable_params.extend(
@@ -124,12 +151,16 @@ class TRMBankTrainer:
             )
 
         if not trainable_params:
-            logger.warning("No trainable parameters found. Check requires_grad flags.")
+            if self._is_main_process:
+                logger.warning("No trainable parameters found. Check requires_grad flags.")
 
+        # With DDP (accelerate), avoid PagedAdamW (it has device_map issues).
+        # With device_map="auto" (single-process), PagedAdamW is OK on 1 GPU.
+        has_ddp = self.accelerator is not None and torch.cuda.device_count() > 1
         use_paged: bool = (
             PagedAdamW is not None
             and torch.cuda.is_available()
-            and next(self.model.parameters()).is_cuda
+            and not has_ddp
             and torch.cuda.device_count() == 1
         )
         optim_cls = PagedAdamW if use_paged else torch.optim.AdamW
@@ -138,10 +169,11 @@ class TRMBankTrainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        if use_paged:
-            logger.info("Using PagedAdamW optimizer (CPU-offloaded Adam states).")
-        else:
-            logger.info("Using standard AdamW optimizer.")
+        if self._is_main_process:
+            if use_paged:
+                logger.info("Using PagedAdamW optimizer (CPU-offloaded Adam states).")
+            else:
+                logger.info("Using standard AdamW optimizer.")
 
         # Linear warmup + cosine decay scheduler.
         total_steps = config.num_epochs * (
@@ -161,8 +193,21 @@ class TRMBankTrainer:
             self.optimizer, lr_lambda
         )
 
+        # Wrap model, optimizer, scheduler with accelerate for DDP.
+        if self.accelerator is not None:
+            self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+                self.model, self.optimizer, self.scheduler
+            )
+
         self.global_step: int = 0
         self.best_eval_loss: float = float("inf")
+
+    @property
+    def _is_main_process(self) -> bool:
+        """Return True on the main process (or always if no accelerator)."""
+        if self.accelerator is not None:
+            return self.accelerator.is_main_process
+        return True
 
     def _compute_loss(
         self,
@@ -244,12 +289,14 @@ class TRMBankTrainer:
             Average LPRM replay loss over the last batch.
         """
         if self.lprm is None or self.memory is None:
-            logger.warning("No LPRM or memory attached; skipping replay training.")
+            if self._is_main_process:
+                logger.warning("No LPRM or memory attached; skipping replay training.")
             return 0.0
 
         replay = self.memory.replay
         if len(replay) < 2:
-            logger.warning(f"Replay buffer too small ({len(replay)}); skipping.")
+            if self._is_main_process:
+                logger.warning(f"Replay buffer too small ({len(replay)}); skipping.")
             return 0.0
 
         self.lprm.train()
@@ -323,18 +370,24 @@ class TRMBankTrainer:
             num_workers=0,
         )
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="chunk")
+        # Wrap dataloader with accelerate for DDP sharding.
+        if self.accelerator is not None:
+            dataloader = self.accelerator.prepare(dataloader)
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch}", unit="chunk",
+                    disable=not self._is_main_process)
         amp_enabled: bool = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
         for batch in pbar:
             input_ids = batch["input_ids"]             # (1, L_chunk)
             labels = batch["labels"]                   # (1, L_chunk)
             is_last = batch["is_last"]
 
-            # Move input to the first parameter's device.
-            # With device_map="auto", the model handles cross-device dispatch.
-            first_device = next(self.model.parameters()).device
-            input_ids = input_ids.to(first_device)
-            labels = labels.to(first_device)
+            # With accelerate, tensors are already on the correct device.
+            # Without accelerate, move to model's first parameter device.
+            if self.accelerator is None:
+                first_device = next(self.model.parameters()).device
+                input_ids = input_ids.to(first_device)
+                labels = labels.to(first_device)
 
             kwargs: Dict[str, Any] = {"input_ids": input_ids}
             if states is not None:
@@ -379,7 +432,11 @@ class TRMBankTrainer:
                     loss = loss + (self.config.lprm_weight * lprm_loss)
                     total_lprm_loss += lprm_loss.item()
 
-            loss.backward()
+            # Backward pass: use accelerator if available, else plain backward.
+            if self.accelerator is not None:
+                self.accelerator.backward(loss)
+            else:
+                loss.backward()
 
             total_loss += lm_loss.item()
             total_tokens += labels.numel()
@@ -387,10 +444,16 @@ class TRMBankTrainer:
 
             # Gradient accumulation step.
             if (num_batches % self.config.gradient_accumulation_steps == 0) or is_last:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.gradient_clip,
-                )
+                if self.accelerator is not None:
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.gradient_clip,
+                    )
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.gradient_clip,
+                    )
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad()
@@ -398,15 +461,16 @@ class TRMBankTrainer:
 
                 # Early stopping at max_steps.
                 if max_steps_remaining > 0 and self.global_step >= max_steps_remaining:
-                    logger.info(f"Reached max_steps={max_steps_remaining}, stopping early.")
+                    if self._is_main_process:
+                        logger.info(f"Reached max_steps={max_steps_remaining}, stopping early.")
                     break
 
                 if self.global_step % 50 == 0:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-            # Logging.
-            if self.global_step % self.config.log_every_n_steps == 0 and num_batches > 0:
+            # Logging (main process only).
+            if self._is_main_process and self.global_step % self.config.log_every_n_steps == 0 and num_batches > 0:
                 avg_loss = total_loss / max(1, num_batches)
                 avg_lprm = total_lprm_loss / max(1, num_batches)
                 lr = self.scheduler.get_last_lr()[0]
@@ -420,7 +484,8 @@ class TRMBankTrainer:
             if (self.global_step % self.config.eval_every_n_steps == 0
                     and self.eval_dataset is not None):
                 eval_metrics = self.evaluate()
-                logger.info(f"Eval at step {self.global_step}: {eval_metrics}")
+                if self._is_main_process:
+                    logger.info(f"Eval at step {self.global_step}: {eval_metrics}")
                 if eval_metrics.get("loss", float("inf")) < self.best_eval_loss:
                     self.best_eval_loss = eval_metrics["loss"]
                     self._save_checkpoint("best")
@@ -434,10 +499,11 @@ class TRMBankTrainer:
 
         avg_epoch_loss = total_loss / max(1, num_batches)
         avg_epoch_lprm = total_lprm_loss / max(1, num_batches)
-        logger.info(
-            f"Epoch {epoch} complete. avg_loss={avg_epoch_loss:.4f} "
-            f"avg_lprm_loss={avg_epoch_lprm:.4f}"
-        )
+        if self._is_main_process:
+            logger.info(
+                f"Epoch {epoch} complete. avg_loss={avg_epoch_loss:.4f} "
+                f"avg_lprm_loss={avg_epoch_lprm:.4f}"
+            )
         return {"loss": avg_epoch_loss, "lprm_loss": avg_epoch_lprm, "tokens": total_tokens}
 
     @torch.no_grad()
@@ -466,11 +532,17 @@ class TRMBankTrainer:
         for batch in dataloader:
             input_ids = batch["input_ids"]
             labels = batch["labels"]
-            input_ids = input_ids.to(next(self.model.parameters()).device)
-            labels = labels.to(next(self.model.parameters()).device)
+            # With DDP / device_map, tensors are already on the correct device.
+            # Fallback: move to first parameter's device.
+            if self.accelerator is None:
+                first_device = next(self.model.parameters()).device
+                input_ids = input_ids.to(first_device)
+                labels = labels.to(first_device)
 
             outputs = self.model(input_ids=input_ids)
             logits = outputs["logits"]
+            if labels.device != logits.device:
+                labels = labels.to(logits.device)
             loss = self._compute_loss(logits, labels)
             total_loss += loss.item()
             num_batches += 1
@@ -481,41 +553,59 @@ class TRMBankTrainer:
     def _save_checkpoint(self, tag: str = "latest") -> str:
         """Save model and optimizer state.
 
+        Uses ``accelerator.save_state`` when an accelerator is attached,
+        otherwise falls back to manual ``torch.save``.
+
         Args:
             tag: Checkpoint tag (e.g., "latest", "best").
 
         Returns:
             Path to the saved checkpoint.
         """
-        path = f"{self.config.output_dir}/checkpoint_{tag}.pt"
-        state = {
-            "model_state": self.model.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.scheduler.state_dict(),
-            "global_step": self.global_step,
-            "best_eval_loss": self.best_eval_loss,
-        }
-        if self.lprm is not None:
-            state["lprm_state"] = self.lprm.state_dict()
-        torch.save(state, path)
-        logger.info(f"Checkpoint saved to {path}")
+        path = f"{self.config.output_dir}/checkpoint_{tag}"
+
+        if self.accelerator is not None:
+            self.accelerator.save_state(path)
+            if self._is_main_process:
+                logger.info(f"Checkpoint saved via accelerate to {path}")
+        else:
+            path = path + ".pt"
+            state = {
+                "model_state": self.model.state_dict(),
+                "optimizer_state": self.optimizer.state_dict(),
+                "scheduler_state": self.scheduler.state_dict(),
+                "global_step": self.global_step,
+                "best_eval_loss": self.best_eval_loss,
+            }
+            if self.lprm is not None:
+                state["lprm_state"] = self.lprm.state_dict()
+            torch.save(state, path)
+            logger.info(f"Checkpoint saved to {path}")
         return path
 
     def load_checkpoint(self, path: str) -> None:
         """Load model and optimizer state from a checkpoint.
 
+        Uses ``accelerator.load_state`` when an accelerator is attached,
+        otherwise falls back to manual ``torch.load``.
+
         Args:
-            path: Path to the checkpoint file.
+            path: Path to the checkpoint file or directory.
         """
-        state = torch.load(path, map_location="cpu")
-        self.model.load_state_dict(state["model_state"], strict=False)
-        self.optimizer.load_state_dict(state["optimizer_state"])
-        self.scheduler.load_state_dict(state["scheduler_state"])
-        self.global_step = state["global_step"]
-        self.best_eval_loss = state["best_eval_loss"]
-        if self.lprm is not None and "lprm_state" in state:
-            self.lprm.load_state_dict(state["lprm_state"])
-        logger.info(f"Checkpoint loaded from {path} (step {self.global_step})")
+        if self.accelerator is not None:
+            self.accelerator.load_state(path)
+            if self._is_main_process:
+                logger.info(f"Checkpoint loaded via accelerate from {path}")
+        else:
+            state = torch.load(path, map_location="cpu")
+            self.model.load_state_dict(state["model_state"], strict=False)
+            self.optimizer.load_state_dict(state["optimizer_state"])
+            self.scheduler.load_state_dict(state["scheduler_state"])
+            self.global_step = state["global_step"]
+            self.best_eval_loss = state["best_eval_loss"]
+            if self.lprm is not None and "lprm_state" in state:
+                self.lprm.load_state_dict(state["lprm_state"])
+            logger.info(f"Checkpoint loaded from {path} (step {self.global_step})")
 
     def train(self, num_epochs: Optional[int] = None,
               max_steps: Optional[int] = None) -> Dict[str, List[float]]:
@@ -543,7 +633,8 @@ class TRMBankTrainer:
             if total_max > 0:
                 remaining = max(0, total_max - self.global_step)
                 if remaining <= 0:
-                    logger.info(f"max_steps={total_max} already reached.")
+                    if self._is_main_process:
+                        logger.info(f"max_steps={total_max} already reached.")
                     break
 
             train_metrics = self.train_epoch(epoch,

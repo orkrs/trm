@@ -1,17 +1,15 @@
-"""kaggle_train.py — TRM-Bank v3.0 training for Kaggle (2× T4, ~30 GB VRAM).
+"""kaggle_train.py — TRM-Bank v3.0 training for Kaggle (2x T4, DDP).
 
-Uses ``device_map="auto"`` to split the 4-bit Mamba-1.4B backbone across
-both GPUs (model parallelism, not DataParallel/DDP).  Each GPU holds a
-subset of layers; the forward pass flows GPU0 → GPU1.  This gives ~30 GB
-combined VRAM for the model + activations.
+Uses ``accelerate`` for Distributed Data Parallel training.  Each T4
+holds a full copy of the 4-bit quantized Mamba-1.4B backbone and
+processes its own batch independently, with gradient synchronization.
 
-QRandLoRA adapters are created on the same device as their parent layer
-(auto-detected by ``patch_mamba2_with_mamba3``).  The frozen
-``ComplexMIMOMamba3.in_proj`` stays on GPU (no CPU offload needed with
-30 GB budget).
+This eliminates the PCIe bottleneck of ``device_map="auto"`` (pipeline
+parallelism) and should give 2-4x speedup over the previous approach.
 
 Usage (Kaggle notebook):
-    !python kaggle_train.py
+    !pip install accelerate
+    !accelerate launch --num_processes 2 kaggle_train.py
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from loguru import logger
 
 
 # ------------------------------------------------------------------
-# Kaggle 2× T4 optimised config
+# Kaggle 2x T4 optimised config
 # ------------------------------------------------------------------
 
 STAGE1_OVERRIDES: Dict[str, Any] = {
@@ -58,24 +56,10 @@ STAGE2_OVERRIDES: Dict[str, Any] = {
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "processed")
 
 
-def check_gpus() -> None:
-    """Print GPU info and exit if no GPU is available."""
-    if not torch.cuda.is_available():
-        print("[ERROR] Kaggle requires GPU (CUDA). No GPU detected.")
-        print("  Go to Notebook settings -> Accelerator -> GPU T4 x2.")
-        sys.exit(1)
-    n = torch.cuda.device_count()
-    print(f"[OK] {n} GPU(s) detected:")
-    for i in range(n):
-        props = torch.cuda.get_device_properties(i)
-        print(f"  [{i}] {props.name} ({props.total_memory / 1024**3:.1f} GB)")
-
-
 def _load_tokenizer() -> Any:
     """Load tokenizer. Prefer GPT-2 (matches Mamba-1.4B vocab)."""
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("gpt2")
-    print(f"  Tokenizer loaded: gpt2  (vocab {tok.vocab_size})")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok
@@ -159,20 +143,25 @@ def load_tokenized_sequences(jsonl_path: str,
                 if len(chunk) >= 2:
                     sequences.append(torch.tensor(chunk, dtype=torch.long))
 
-    print(f"  Loaded {len(sequences)} sequences from {jsonl_path}")
     return sequences
 
 
 def build_trainer_for_stage(
     stage_name: str,
     jsonl_path: str,
+    accelerator: Any,
     config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Build model, LPRM, memory, router, and trainer for one stage.
 
-    Uses ``device_map="auto"`` to split the 4-bit backbone across all
-    available GPUs.  The per-layer device is auto-detected by
-    ``patch_mamba2_with_mamba3``.
+    The model is loaded without ``device_map`` (stays on CPU), then
+    ``accelerator.prepare()`` handles DDP wrapping and device placement.
+
+    Args:
+        stage_name: Human-readable stage label.
+        jsonl_path: Path to the training JSONL file.
+        accelerator: HuggingFace ``Accelerator`` instance.
+        config_overrides: Optional dataclass field overrides.
     """
     from config import CONFIG
     from core.complex_mimo_mamba import TRMBankModel
@@ -183,12 +172,12 @@ def build_trainer_for_stage(
         from dataclasses import replace
         cfg = replace(cfg, **config_overrides)
 
-    print(f"\n{'=' * 60}")
-    print(f"Stage: {stage_name}")
-    print(f"{'=' * 60}")
+    accelerator.print(f"\n{'=' * 60}")
+    accelerator.print(f"Stage: {stage_name}")
+    accelerator.print(f"{'=' * 60}")
 
     # ---- 1. Load tokenized sequences ----
-    print("\n[1/5] Loading dataset...")
+    accelerator.print("\n[1/5] Loading dataset...")
     sequences = load_tokenized_sequences(jsonl_path,
                                          max_seq_length=cfg.max_seq_length)
     if not sequences:
@@ -197,13 +186,15 @@ def build_trainer_for_stage(
         data=sequences,
         truncation_length=cfg.truncation_length,
         seq_length=cfg.max_seq_length,
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
     )
-    print(f"  Dataset chunks: {len(train_dataset)}")
+    accelerator.print(f"  Dataset chunks: {len(train_dataset)}")
 
     # ---- 2. Build TRMBankModel ----
-    # device=None → device_map="auto" splits across all GPUs.
-    # cpu_offload_in_proj=False → keep in_proj on GPU (30 GB budget).
-    print("\n[2/5] Building TRMBankModel (Mamba-1.4B 4-bit, device_map=auto)...")
+    # device=None + use_4bit=True: model loads on CPU (no device_map).
+    # accelerator.prepare() will handle DDP wrapping and GPU placement.
+    accelerator.print("\n[2/5] Building TRMBankModel (Mamba-1.4B 4-bit, DDP)...")
     model = TRMBankModel(
         pretrained_name="state-spaces/mamba-1.4b-hf",
         mimo_rank=CONFIG.mimo.mimo_rank,
@@ -215,7 +206,6 @@ def build_trainer_for_stage(
         qrandlora_sparsity=CONFIG.qrandlora.sparsity,
         qrandlora_num_components=CONFIG.qrandlora.num_components,
         qrandlora_target_modules=CONFIG.qrandlora.target_modules,
-        cpu_offload_in_proj=True,
     )
     model.build()
     model.train()
@@ -223,29 +213,24 @@ def build_trainer_for_stage(
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             torch.cuda.reset_peak_memory_stats(i)
-    _log_all_gpu("after build")
-    print(f"  Hidden dim: {model.hidden_dim}, Layers: {model.num_layers}")
-    print(f"  QRandLoRA patched: {model._qr_patched_count} layers")
+    accelerator.print(f"  Hidden dim: {model.hidden_dim}, Layers: {model.num_layers}")
+    accelerator.print(f"  QRandLoRA patched: {model._qr_patched_count} layers")
 
     # ---- 3. MultiHeadLPRM ----
-    # Place LPRM on the device of the last layer (output device).
-    print("\n[3/5] Initialising MultiHeadLPRM...")
+    accelerator.print("\n[3/5] Initialising MultiHeadLPRM...")
     from router.lprm import MultiHeadLPRM
 
-    lprm_device = _last_layer_device(model)
     lprm = MultiHeadLPRM(
         module_names=list(CONFIG.router.module_names),
         hidden_dim=model.hidden_dim,
         num_heads=model.hidden_dim // 8,
         dropout=CONFIG.router.lprm.dropout,
     )
-    lprm = lprm.to(lprm_device)
     lprm.train()
-    print(f"  LPRM heads: {len(lprm.module_names)}, hidden: {lprm.hidden_dim}")
-    print(f"  LPRM device: {lprm_device}")
+    accelerator.print(f"  LPRM heads: {len(lprm.module_names)}, hidden: {lprm.hidden_dim}")
 
     # ---- 4. Pipeline (memory + router) ----
-    print("\n[4/5] Setting up memory and router...")
+    accelerator.print("\n[4/5] Setting up memory and router...")
     from memory.hierarchical_memory import HierarchicalMemory
     from router.game_theoretic_router import GameTheoreticRouter
 
@@ -266,91 +251,78 @@ def build_trainer_for_stage(
         memory_top_k=CONFIG.memory.top_k_retrieval,
         router_interval=0,
     )
-    print("  Pipeline attached: memory + router + LPRM")
+    accelerator.print("  Pipeline attached: memory + router + LPRM")
 
     # ---- 5. Trainer ----
-    print(f"\n[5/5] Initialising TRMBankTrainer...")
+    accelerator.print(f"\n[5/5] Initialising TRMBankTrainer...")
     trainer = TRMBankTrainer(
         model=model,
         lprm=lprm,
         config=cfg,
         train_dataset=train_dataset,
         memory=memory,
+        accelerator=accelerator,
     )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Trainable params: {trainable:,}")
-    print(f"  Batch size: {cfg.batch_size}")
-    print(f"  Gradient accumulation: {cfg.gradient_accumulation_steps}")
-    print(f"  Effective batch: {cfg.batch_size * cfg.gradient_accumulation_steps}")
-    print(f"  Truncation length: {cfg.truncation_length}")
-    print(f"  Max steps: {cfg.max_steps}")
-    print(f"  Output dir: {cfg.output_dir}")
+    accelerator.print(f"  Trainable params: {trainable:,}")
+    accelerator.print(f"  Batch size: {cfg.batch_size}")
+    accelerator.print(f"  Gradient accumulation: {cfg.gradient_accumulation_steps}")
+    accelerator.print(f"  Effective batch: {cfg.batch_size * cfg.gradient_accumulation_steps}")
+    accelerator.print(f"  Truncation length: {cfg.truncation_length}")
+    accelerator.print(f"  Max steps: {cfg.max_steps}")
+    accelerator.print(f"  Output dir: {cfg.output_dir}")
 
     return trainer
 
 
-def _last_layer_device(model: Any) -> torch.device:
-    """Return the device of the last layer's output (where logits live)."""
-    for p in model.parameters():
-        device = p.device
-    return device
-
-
-def _log_all_gpu(tag: str) -> None:
-    if not torch.cuda.is_available():
-        return
-    for i in range(torch.cuda.device_count()):
-        alloc = torch.cuda.memory_allocated(i) / 1024**3
-        peak = torch.cuda.max_memory_allocated(i) / 1024**3
-        print(f"  [GPU {i} {tag}] allocated={alloc:.2f}GB peak={peak:.2f}GB")
-
-
 def main() -> None:
-    print("=" * 60)
-    print("TRM-Bank v3.0 — Kaggle Training (2×T4, device_map=auto)")
-    print("=" * 60)
+    from accelerate import Accelerator
 
-    check_gpus()
+    accelerator = Accelerator()
+
+    accelerator.print("=" * 60)
+    accelerator.print("TRM-Bank v3.0 — Kaggle Training (2xT4, DDP via accelerate)")
+    accelerator.print("=" * 60)
 
     stage1_path = os.path.join(DATA_DIR, "stage1_qrandlora.jsonl")
     stage2_path = os.path.join(DATA_DIR, "stage2_router.jsonl")
     for p in (stage1_path, stage2_path):
         if not os.path.isfile(p):
-            print(f"\n[ERROR] Dataset not found: {p}")
-            print("  Run `python prepare_datasets.py` first.")
+            accelerator.print(f"\n[ERROR] Dataset not found: {p}")
+            accelerator.print("  Run `python prepare_datasets.py` first.")
             sys.exit(1)
 
-    # ---- Stage 1: QRandLoRA pretraining (500 steps) ----
+    # ---- Stage 1: QRandLoRA pretraining (200 steps) ----
     trainer1 = build_trainer_for_stage(
-        "Stage 1 — QRandLoRA Pretraining (500 steps)",
+        "Stage 1 — QRandLoRA Pretraining (200 steps)",
         stage1_path,
+        accelerator,
         config_overrides=STAGE1_OVERRIDES,
     )
-    print("\n[Training] Stage 1: QRandLoRA pretraining...")
+    accelerator.print("\n[Training] Stage 1: QRandLoRA pretraining...")
     history1 = trainer1.train(max_steps=STAGE1_OVERRIDES["max_steps"])
     final_loss1 = history1["train_loss"][-1] if history1["train_loss"] else float("nan")
-    print(f"  Stage 1 complete. Final train loss: {final_loss1:.4f}")
-    _log_all_gpu("after stage 1")
+    accelerator.print(f"  Stage 1 complete. Final train loss: {final_loss1:.4f}")
 
     # ---- Stage 2: Router + LPRM tuning (300 steps) ----
     trainer2 = build_trainer_for_stage(
         "Stage 2 — Router + LPRM Tuning (300 steps)",
         stage2_path,
+        accelerator,
         config_overrides=STAGE2_OVERRIDES,
     )
-    print("\n[Training] Stage 2: Router + LPRM tuning...")
+    accelerator.print("\n[Training] Stage 2: Router + LPRM tuning...")
     history2 = trainer2.train(max_steps=STAGE2_OVERRIDES["max_steps"])
     final_loss2 = history2["train_loss"][-1] if history2["train_loss"] else float("nan")
-    print(f"  Stage 2 complete. Final train loss: {final_loss2:.4f}")
-    _log_all_gpu("after stage 2")
+    accelerator.print(f"  Stage 2 complete. Final train loss: {final_loss2:.4f}")
 
     # ---- Summary ----
-    print("\n" + "=" * 60)
-    print("TRM-Bank v3.0 training complete.")
-    print(f"  Stage 1 (QRandLoRA, 500 steps) loss: {final_loss1:.4f}")
-    print(f"  Stage 2 (Router+LPRM, 300 steps) loss: {final_loss2:.4f}")
-    print(f"  Checkpoints: {STAGE1_OVERRIDES['output_dir']}/")
-    print("=" * 60)
+    accelerator.print("\n" + "=" * 60)
+    accelerator.print("TRM-Bank v3.0 training complete.")
+    accelerator.print(f"  Stage 1 (QRandLoRA, 200 steps) loss: {final_loss1:.4f}")
+    accelerator.print(f"  Stage 2 (Router+LPRM, 300 steps) loss: {final_loss2:.4f}")
+    accelerator.print(f"  Checkpoints: {STAGE1_OVERRIDES['output_dir']}/")
+    accelerator.print("=" * 60)
 
 
 if __name__ == "__main__":

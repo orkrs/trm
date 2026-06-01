@@ -434,6 +434,8 @@ class ComplexMIMOMamba3(nn.Module):
         B, L, D = x_ssm.shape
         outputs: List[torch.Tensor] = []
         prev_inp: Optional[torch.Tensor] = None
+        # Accumulate state in float32 to prevent exp(A*dt) overflow in bfloat16.
+        h = h.float()
 
         for t_idx in range(L):
             x_t = x_ssm[:, t_idx, :]
@@ -451,34 +453,34 @@ class ComplexMIMOMamba3(nn.Module):
             dt_t_exp = rearrange(dt_t_exp, "b g h -> b (g h)")
 
             if prev_inp is not None:
-                prev_rot = _rotate_head_grouped(prev_inp, cos_t, sin_t, nheads=H)
-                decay_prev = torch.exp(A_t_exp * dt_t_exp.unsqueeze(-1))
+                prev_rot = _rotate_head_grouped(prev_inp.float(), cos_t.float(), sin_t.float(), nheads=H)
+                decay_prev = torch.exp(A_t_exp.float() * dt_t_exp.float().unsqueeze(-1))
                 prev_inp_weighted = prev_rot * decay_prev
             else:
                 prev_inp_weighted = torch.zeros_like(h)
 
             B_t_exp = B_t.unsqueeze(1).expand(-1, G, -1, -1, -1)
             B_t_exp = rearrange(B_t_exp, "b g h n r -> b (g h) n r")
-            curr_inp = B_t_exp * x_t.unsqueeze(-1).unsqueeze(-1)
+            curr_inp = B_t_exp.float() * x_t.float().unsqueeze(-1).unsqueeze(-1)
             curr_inp = curr_inp.sum(dim=-1)
 
-            h_rot = _rotate_head_grouped(h, cos_t, sin_t, nheads=H)
-            decay = torch.exp(A_t_exp * dt_t_exp.unsqueeze(-1))
+            h_rot = _rotate_head_grouped(h, cos_t.float(), sin_t.float(), nheads=H)
+            decay = torch.exp(A_t_exp.float() * dt_t_exp.float().unsqueeze(-1))
 
             trap_channel = trap_t.unsqueeze(1).expand(-1, G, -1)
             trap_channel = rearrange(trap_channel, "b g h -> b (g h)")
 
             h = (
                 decay * h_rot
-                + (1.0 - trap_channel.unsqueeze(-1)) * dt_t_exp.unsqueeze(-1) * prev_inp_weighted
-                + trap_channel.unsqueeze(-1) * dt_t_exp.unsqueeze(-1) * curr_inp
+                + (1.0 - trap_channel.float().unsqueeze(-1)) * dt_t_exp.float().unsqueeze(-1) * prev_inp_weighted
+                + trap_channel.float().unsqueeze(-1) * dt_t_exp.float().unsqueeze(-1) * curr_inp
             )
 
             prev_inp = curr_inp.clone()
 
             C_t_exp = C_t.unsqueeze(1).expand(-1, G, -1, -1, -1)
             C_t_exp = rearrange(C_t_exp, "b g h r n -> b (g h) r n")
-            y_t = torch.einsum("b d r n, b d n -> b d r", C_t_exp, h)
+            y_t = torch.einsum("b d r n, b d n -> b d r", C_t_exp.float(), h).to(x_ssm.dtype)
 
             D_exp = D_head.unsqueeze(0).unsqueeze(1).expand(-1, G, -1)
             D_exp = rearrange(D_exp, "b g h -> b (g h)")
@@ -995,6 +997,12 @@ class TRMBankModel(nn.Module):
     def _load_pretrained(self) -> Any:
         """Load the pretrained Mamba model with 4-bit quantization.
 
+        When ``self._device`` is ``None`` and ``use_4bit`` is True, the
+        model is loaded on CPU (``device_map=None``) so that
+        ``accelerator.prepare()`` can handle DDP wrapping and device
+        placement.  This avoids the PCIe bottleneck of
+        ``device_map="auto"`` (pipeline parallelism).
+
         Returns:
             Loaded HuggingFace model.
 
@@ -1020,13 +1028,24 @@ class TRMBankModel(nn.Module):
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-            model = transformers.AutoModelForCausalLM.from_pretrained(
-                self.pretrained_name,
-                quantization_config=quantization_config,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-            )
+            # device=None: load on CPU for DDP (accelerator.prepare handles placement).
+            # device=<cuda>: load on specific device (for device_map="auto" single-process).
+            if self._device is None:
+                model = transformers.AutoModelForCausalLM.from_pretrained(
+                    self.pretrained_name,
+                    quantization_config=quantization_config,
+                    device_map=None,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                )
+            else:
+                model = transformers.AutoModelForCausalLM.from_pretrained(
+                    self.pretrained_name,
+                    quantization_config=quantization_config,
+                    device_map="auto",
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                )
         else:
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 self.pretrained_name,
