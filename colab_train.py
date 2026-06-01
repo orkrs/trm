@@ -226,7 +226,7 @@ def build_trainer_for_stage(
 
     lprm = MultiHeadLPRM(
         module_names=list(CONFIG.router.module_names),
-        hidden_dim=CONFIG.router.lprm.hidden_dim,
+        hidden_dim=model.hidden_dim,
         num_heads=model.hidden_dim // 8,
         dropout=CONFIG.router.lprm.dropout,
     )
