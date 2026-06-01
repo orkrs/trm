@@ -485,10 +485,11 @@ class ComplexMIMOMamba3(nn.Module):
 
             # Apply per-head per-branch MIMO output scaling mimo_o: (H, R, P)
             # y_t: (B, D, R) -> reshape to (B, H, G, R) -> scale -> back to (B, D, R)
-            mimo_o_exp = mimo_o[:, :R, :P]              # (H, R, P)
-            mimo_o_exp = mimo_o_exp.unsqueeze(0)         # (1, H, R, P)
+            # mimo_o: (H, R, P) -> mean over P -> (H, R) -> expand to (1, H, 1, R) for broadcasting
+            mimo_o_scale = mimo_o[:, :R, :P].mean(dim=-1)  # (H, R) - average over P dimension
+            mimo_o_scale = mimo_o_scale.unsqueeze(0).unsqueeze(2)  # (1, H, 1, R)
             y_t_reshaped = rearrange(y_t, "b (h g) r -> b h g r", h=H, g=G)
-            y_t_reshaped = y_t_reshaped * mimo_o_exp.mean(dim=-1, keepdim=True)  # (B, H, G, R) * (1, H, 1, R)
+            y_t_reshaped = y_t_reshaped * mimo_o_scale  # (B, H, G, R) * (1, H, 1, R) - broadcasts over G
             y_t = rearrange(y_t_reshaped, "b h g r -> b (h g) r")
 
             D_exp = D_head.unsqueeze(0).unsqueeze(1).expand(-1, G, -1)
