@@ -151,9 +151,9 @@ class QRandLoRALayer(nn.Module):
         Raises:
             RuntimeError: If input shape is incompatible.
         """
-        return self._apply(x)
+        return self._apply_lora(x)
 
-    def _apply(self, x: torch.Tensor) -> torch.Tensor:
+    def _apply_lora(self, x: torch.Tensor) -> torch.Tensor:
         """Inner forward: compute the LoRA additive update.
 
         Args:
