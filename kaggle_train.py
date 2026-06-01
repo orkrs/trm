@@ -1,13 +1,17 @@
-"""colab_train.py — TRM-Bank v3.0 training entry point for Google Colab (T4, 16 GB).
+"""kaggle_train.py — TRM-Bank v3.0 training for Kaggle (2× T4, ~30 GB VRAM).
 
-Usage:
-    python prepare_datasets.py   # 1. prepare data
-    python verify_modules.py     # 2. verify providers
-    python colab_train.py        # 3. train
+Uses ``device_map="auto"`` to split the 4-bit Mamba-1.4B backbone across
+both GPUs (model parallelism, not DataParallel/DDP).  Each GPU holds a
+subset of layers; the forward pass flows GPU0 → GPU1.  This gives ~30 GB
+combined VRAM for the model + activations.
 
-The script downloads Mamba-1.4B in 4-bit NF4, patches all SSM mixers
-with ComplexMIMOMamba3, applies QRandLoRA (r=64), attaches the LPRM
-head and game-theoretic router, and runs truncated-BPTT training.
+QRandLoRA adapters are created on the same device as their parent layer
+(auto-detected by ``patch_mamba2_with_mamba3``).  The frozen
+``ComplexMIMOMamba3.in_proj`` stays on GPU (no CPU offload needed with
+30 GB budget).
+
+Usage (Kaggle notebook):
+    !python kaggle_train.py
 """
 
 from __future__ import annotations
@@ -24,13 +28,13 @@ from loguru import logger
 
 
 # ------------------------------------------------------------------
-# Colab T4 optimised config
+# Kaggle 2× T4 optimised config
 # ------------------------------------------------------------------
 
 STAGE1_OVERRIDES: Dict[str, Any] = {
-    "batch_size": 1,
+    "batch_size": 2,
     "gradient_accumulation_steps": 8,
-    "truncation_length": 128,
+    "truncation_length": 256,
     "learning_rate": 3e-4,
     "warmup_steps": 30,
     "max_steps": 500,
@@ -38,8 +42,8 @@ STAGE1_OVERRIDES: Dict[str, Any] = {
     "log_every_n_steps": 10,
     "eval_every_n_steps": 250,
     "save_every_n_steps": 250,
-    "output_dir": "./outputs_colab",
-    "max_seq_length": 512,
+    "output_dir": "./outputs_kaggle",
+    "max_seq_length": 1024,
     "lprm_weight": 0.1,
     "gradient_checkpointing": True,
 }
@@ -54,28 +58,24 @@ STAGE2_OVERRIDES: Dict[str, Any] = {
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "processed")
 
 
-def check_gpu() -> torch.device:
-    """Exit with a clear message if no GPU is available."""
+def check_gpus() -> None:
+    """Print GPU info and exit if no GPU is available."""
     if not torch.cuda.is_available():
-        print("[ERROR] Colab requires GPU (CUDA). No GPU detected.")
-        print("  Go to Runtime -> Change runtime type -> T4 GPU.")
+        print("[ERROR] Kaggle requires GPU (CUDA). No GPU detected.")
+        print("  Go to Notebook settings -> Accelerator -> GPU T4 x2.")
         sys.exit(1)
-    device = torch.device("cuda")
-    gpu_name = torch.cuda.get_device_name(0)
-    free_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    print(f"[OK] GPU: {gpu_name} ({free_mem:.1f} GB)")
-    return device
+    n = torch.cuda.device_count()
+    print(f"[OK] {n} GPU(s) detected:")
+    for i in range(n):
+        props = torch.cuda.get_device_properties(i)
+        print(f"  [{i}] {props.name} ({props.total_mem / 1024**3:.1f} GB)")
 
 
 def _load_tokenizer() -> Any:
     """Load tokenizer. Prefer GPT-2 (matches Mamba-1.4B vocab)."""
     from transformers import AutoTokenizer
-    try:
-        tok = AutoTokenizer.from_pretrained("gpt2")
-        print(f"  Tokenizer loaded: gpt2  (vocab {tok.vocab_size})")
-    except Exception:
-        tok = AutoTokenizer.from_pretrained("gpt2")
-        print("  [WARN] Using default GPT-2 tokenizer")
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    print(f"  Tokenizer loaded: gpt2  (vocab {tok.vocab_size})")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return tok
@@ -166,10 +166,14 @@ def load_tokenized_sequences(jsonl_path: str,
 def build_trainer_for_stage(
     stage_name: str,
     jsonl_path: str,
-    device: torch.device,
     config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """Build model, LPRM, memory, router, and trainer for one stage."""
+    """Build model, LPRM, memory, router, and trainer for one stage.
+
+    Uses ``device_map="auto"`` to split the 4-bit backbone across all
+    available GPUs.  The per-layer device is auto-detected by
+    ``patch_mamba2_with_mamba3``.
+    """
     from config import CONFIG
     from core.complex_mimo_mamba import TRMBankModel
     from training.trainer import TruncatedBPTTDataset, TRMBankTrainer
@@ -186,7 +190,7 @@ def build_trainer_for_stage(
     # ---- 1. Load tokenized sequences ----
     print("\n[1/5] Loading dataset...")
     sequences = load_tokenized_sequences(jsonl_path,
-                                         max_seq_length=cfg.truncation_length)
+                                         max_seq_length=cfg.max_seq_length)
     if not sequences:
         raise RuntimeError(f"No sequences loaded from {jsonl_path}")
     train_dataset = TruncatedBPTTDataset(
@@ -197,43 +201,48 @@ def build_trainer_for_stage(
     print(f"  Dataset chunks: {len(train_dataset)}")
 
     # ---- 2. Build TRMBankModel ----
-    print("\n[2/5] Building TRMBankModel (Mamba-1.4B 4-bit)...")
+    # device=None → device_map="auto" splits across all GPUs.
+    # cpu_offload_in_proj=False → keep in_proj on GPU (30 GB budget).
+    print("\n[2/5] Building TRMBankModel (Mamba-1.4B 4-bit, device_map=auto)...")
     model = TRMBankModel(
         pretrained_name="state-spaces/mamba-1.4b-hf",
         mimo_rank=CONFIG.mimo.mimo_rank,
         d_state=CONFIG.model.d_state,
         use_4bit=True,
-        device=device,
+        device=None,
         qrandlora_r=64,
         qrandlora_alpha=CONFIG.qrandlora.scaling_init,
         qrandlora_sparsity=CONFIG.qrandlora.sparsity,
         qrandlora_num_components=CONFIG.qrandlora.num_components,
         qrandlora_target_modules=CONFIG.qrandlora.target_modules,
+        cpu_offload_in_proj=False,
     )
     model.build()
-    # 4-bit model is already on GPU via device_map="auto".
     model.train()
     gc.collect()
-    torch.cuda.empty_cache()
-    print(f"  GPU memory after build: allocated={torch.cuda.memory_allocated()/1024**3:.2f}GB "
-          f"reserved={torch.cuda.memory_reserved()/1024**3:.2f}GB")
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(i)
+    _log_all_gpu("after build")
     print(f"  Hidden dim: {model.hidden_dim}, Layers: {model.num_layers}")
     print(f"  QRandLoRA patched: {model._qr_patched_count} layers")
 
     # ---- 3. MultiHeadLPRM ----
+    # Place LPRM on the device of the last layer (output device).
     print("\n[3/5] Initialising MultiHeadLPRM...")
     from router.lprm import MultiHeadLPRM
 
+    lprm_device = _last_layer_device(model)
     lprm = MultiHeadLPRM(
         module_names=list(CONFIG.router.module_names),
         hidden_dim=CONFIG.router.lprm.hidden_dim,
         num_heads=model.hidden_dim // 8,
         dropout=CONFIG.router.lprm.dropout,
     )
-    lprm = lprm.to(device)
+    lprm = lprm.to(lprm_device)
     lprm.train()
     print(f"  LPRM heads: {len(lprm.module_names)}, hidden: {lprm.hidden_dim}")
-    print(f"  GPU memory after LPRM: allocated={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+    print(f"  LPRM device: {lprm_device}")
 
     # ---- 4. Pipeline (memory + router) ----
     print("\n[4/5] Setting up memory and router...")
@@ -258,7 +267,6 @@ def build_trainer_for_stage(
         router_interval=0,
     )
     print("  Pipeline attached: memory + router + LPRM")
-    print(f"  GPU memory after pipeline: allocated={torch.cuda.memory_allocated()/1024**3:.2f}GB")
 
     # ---- 5. Trainer ----
     print(f"\n[5/5] Initialising TRMBankTrainer...")
@@ -269,7 +277,8 @@ def build_trainer_for_stage(
         train_dataset=train_dataset,
         memory=memory,
     )
-    print(f"  Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Trainable params: {trainable:,}")
     print(f"  Batch size: {cfg.batch_size}")
     print(f"  Gradient accumulation: {cfg.gradient_accumulation_steps}")
     print(f"  Effective batch: {cfg.batch_size * cfg.gradient_accumulation_steps}")
@@ -280,12 +289,28 @@ def build_trainer_for_stage(
     return trainer
 
 
+def _last_layer_device(model: Any) -> torch.device:
+    """Return the device of the last layer's output (where logits live)."""
+    for p in model.parameters():
+        device = p.device
+    return device
+
+
+def _log_all_gpu(tag: str) -> None:
+    if not torch.cuda.is_available():
+        return
+    for i in range(torch.cuda.device_count()):
+        alloc = torch.cuda.memory_allocated(i) / 1024**3
+        peak = torch.cuda.max_memory_allocated(i) / 1024**3
+        print(f"  [GPU {i} {tag}] allocated={alloc:.2f}GB peak={peak:.2f}GB")
+
+
 def main() -> None:
     print("=" * 60)
-    print("TRM-Bank v3.0 — Colab Training (T4 optimised)")
+    print("TRM-Bank v3.0 — Kaggle Training (2×T4, device_map=auto)")
     print("=" * 60)
 
-    device = check_gpu()
+    check_gpus()
 
     stage1_path = os.path.join(DATA_DIR, "stage1_qrandlora.jsonl")
     stage2_path = os.path.join(DATA_DIR, "stage2_router.jsonl")
@@ -299,25 +324,25 @@ def main() -> None:
     trainer1 = build_trainer_for_stage(
         "Stage 1 — QRandLoRA Pretraining (500 steps)",
         stage1_path,
-        device,
         config_overrides=STAGE1_OVERRIDES,
     )
     print("\n[Training] Stage 1: QRandLoRA pretraining...")
     history1 = trainer1.train(max_steps=STAGE1_OVERRIDES["max_steps"])
     final_loss1 = history1["train_loss"][-1] if history1["train_loss"] else float("nan")
     print(f"  Stage 1 complete. Final train loss: {final_loss1:.4f}")
+    _log_all_gpu("after stage 1")
 
     # ---- Stage 2: Router + LPRM tuning (300 steps) ----
     trainer2 = build_trainer_for_stage(
         "Stage 2 — Router + LPRM Tuning (300 steps)",
         stage2_path,
-        device,
         config_overrides=STAGE2_OVERRIDES,
     )
     print("\n[Training] Stage 2: Router + LPRM tuning...")
     history2 = trainer2.train(max_steps=STAGE2_OVERRIDES["max_steps"])
     final_loss2 = history2["train_loss"][-1] if history2["train_loss"] else float("nan")
     print(f"  Stage 2 complete. Final train loss: {final_loss2:.4f}")
+    _log_all_gpu("after stage 2")
 
     # ---- Summary ----
     print("\n" + "=" * 60)

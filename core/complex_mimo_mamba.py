@@ -339,6 +339,7 @@ class ComplexMIMOMamba3(nn.Module):
         dtype: Optional[torch.dtype] = None,
         precomputed_projections: bool = False,
         gradient_checkpointing: bool = False,
+        cpu_offload_in_proj: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
@@ -373,7 +374,23 @@ class ComplexMIMOMamba3(nn.Module):
                 + (d_state // 2) * nheads
             )
 
-        self.in_proj = nn.Linear(d_model, in_total, **factory)
+        # Frozen in_proj: auto-offload to CPU on small VRAM GPUs.
+        # Saves ~3.5 GB VRAM for 24 patched layers on T4 (16 GB).
+        # On 2x T4 (~30 GB) or larger, weights stay on GPU.
+        if cpu_offload_in_proj is None:
+            self._in_proj_cpu_offload: bool = (
+                precomputed_projections
+                and device is not None
+                and device.type == "cuda"
+            )
+        else:
+            self._in_proj_cpu_offload = cpu_offload_in_proj
+
+        if self._in_proj_cpu_offload:
+            cpu_factory = {"device": torch.device("cpu"), "dtype": dtype}
+            self.in_proj = nn.Linear(d_model, in_total, bias=False, **cpu_factory)
+        else:
+            self.in_proj = nn.Linear(d_model, in_total, bias=False, **factory)
 
         # Per-head learned parameters
         self.A_log = nn.Parameter(torch.randn(nheads, d_state, **factory) * 0.01)
@@ -506,8 +523,12 @@ class ComplexMIMOMamba3(nn.Module):
         device: torch.device = x.device
         dtpe: torch.dtype = x.dtype
 
-        # ---- 1. in_proj and split ----
-        proj = self.in_proj(x)
+        # ---- 1. in_proj and split (with CPU offload support) ----
+        if self._in_proj_cpu_offload:
+            # in_proj.weight is on CPU (frozen); move input to CPU, compute, result back to GPU
+            proj = self.in_proj(x.to(device="cpu")).to(device=device, dtype=dtpe)
+        else:
+            proj = self.in_proj(x)
         # proj: (B, L, total)
 
         off: int = 0
@@ -931,6 +952,7 @@ class TRMBankModel(nn.Module):
         qrandlora_sparsity: float = 0.1,
         qrandlora_num_components: int = 8,
         qrandlora_target_modules: Optional[Tuple[str, ...]] = None,
+        cpu_offload_in_proj: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
@@ -939,6 +961,7 @@ class TRMBankModel(nn.Module):
         self.d_state: int = d_state
         self.use_4bit: bool = use_4bit
         self._device: Optional[torch.device] = device
+        self._cpu_offload_in_proj: Optional[bool] = cpu_offload_in_proj
 
         self._qrandlora_r: int = qrandlora_r
         self._qrandlora_alpha: float = qrandlora_alpha
@@ -1016,6 +1039,13 @@ class TRMBankModel(nn.Module):
             else:
                 param.requires_grad = False
 
+    def _log_mem(self, tag: str) -> None:
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                alloc = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                logger.info(f"[MEM {tag} GPU{i}] allocated={alloc:.2f}GB reserved={reserved:.2f}GB")
+
     @torch.no_grad()
     def build(self) -> None:
         """Load the pretrained backbone and replace all SSM mixers.
@@ -1028,7 +1058,9 @@ class TRMBankModel(nn.Module):
         """
         from core.mamba3_adapter import patch_mamba2_with_mamba3
 
+        self._log_mem("before_load")
         model = self._load_pretrained()
+        self._log_mem("after_load")
 
         # Tie lm_head to embeddings if missing from checkpoint.
         # Mamba checkpoints do not include lm_head weights.
@@ -1039,11 +1071,13 @@ class TRMBankModel(nn.Module):
                 logger.info("lm_head.weight tied to backbone.embeddings.weight")
 
         self.backbone = model
+        self._log_mem("after_tie")
 
         config = model.config
         self.hidden_dim = getattr(config, "hidden_size", 2560)
         self.num_layers = getattr(config, "num_hidden_layers", 64)
 
+        self._log_mem("before_patch")
         n_patched = patch_mamba2_with_mamba3(
             self.backbone,
             d_state=self.d_state,
@@ -1052,9 +1086,13 @@ class TRMBankModel(nn.Module):
             device=self._device,
             dtype=torch.bfloat16,
             gradient_checkpointing=True,
+            cpu_offload_in_proj=self._cpu_offload_in_proj,
         )
+        self._log_mem("after_patch")
+        logger.info(f"Patched {n_patched} mixers with ComplexMIMOMamba3")
 
         self._qr_patched_count = self._apply_qrandlora()
+        self._log_mem("after_qrandlora")
 
         # Freeze the backbone parameters, keeping only the adapter parameters trainable
         self._freeze_backbone()

@@ -216,6 +216,8 @@ class TRMBankTrainer:
         target = p_correct.unsqueeze(-1)                                 # (B, L, 1)
 
         q_pred = self.lprm(hidden_states)                               # (B, L, M)
+        if target.device != q_pred.device:
+            target = target.to(q_pred.device)
         loss = F.mse_loss(q_pred, target.expand_as(q_pred))
         return loss
 
@@ -251,7 +253,9 @@ class TRMBankTrainer:
         self.lprm.train()
         optim = torch.optim.AdamW(self.lprm.parameters(), lr=lr)
 
-        device = next(self.model.parameters()).device
+        # With device_map="auto", LPRM may be on a different GPU than the
+        # first model parameter.  Use the LPRM's own device.
+        lprm_device = next(self.lprm.parameters()).device
         module_names = self.lprm.module_names if hasattr(self.lprm, "module_names") else []
         name_to_idx = {name: i for i, name in enumerate(module_names)}
 
@@ -264,14 +268,14 @@ class TRMBankTrainer:
             hidden_states: List[torch.Tensor] = []
             targets: List[float] = []
             for exp in exps:
-                hidden_states.append(exp.hidden_for_lprm.to(device))
+                hidden_states.append(exp.hidden_for_lprm.to(lprm_device))
                 targets.append(exp.reward)
 
             h: torch.Tensor = torch.cat(hidden_states, dim=0)           # (B, D)
 
             module_idx = name_to_idx.get(exps[0].module_name, 0)
             q_pred: torch.Tensor = self.lprm(h, module_idx=module_idx)  # (B, 1)
-            true = torch.tensor(targets, device=device, dtype=q_pred.dtype).unsqueeze(-1)
+            true = torch.tensor(targets, device=lprm_device, dtype=q_pred.dtype).unsqueeze(-1)
             # true: (B, 1)
 
             loss = F.mse_loss(q_pred, true)
@@ -324,8 +328,11 @@ class TRMBankTrainer:
             labels = batch["labels"]                   # (1, L_chunk)
             is_last = batch["is_last"]
 
-            input_ids = input_ids.to(next(self.model.parameters()).device)
-            labels = labels.to(next(self.model.parameters()).device)
+            # Move input to the first parameter's device.
+            # With device_map="auto", the model handles cross-device dispatch.
+            first_device = next(self.model.parameters()).device
+            input_ids = input_ids.to(first_device)
+            labels = labels.to(first_device)
 
             kwargs: Dict[str, Any] = {"input_ids": input_ids}
             if states is not None:
@@ -343,12 +350,21 @@ class TRMBankTrainer:
                 logits = outputs["logits"]
                 hidden_states = outputs.get("hidden_states", None)
 
+                # Labels must be on the same device as logits
+                # (with device_map="auto", logits may be on the last GPU).
+                if labels.device != logits.device:
+                    labels = labels.to(logits.device)
+
                 # Language modelling loss.
                 lm_loss = self._compute_loss(logits, labels)
                 loss = lm_loss / self.config.gradient_accumulation_steps
 
                 # LPRM auxiliary loss (teaches heads to predict model confidence).
                 if self.lprm is not None and hidden_states is not None:
+                    # hidden_states may be on a different device than LPRM.
+                    lprm_device = next(self.lprm.parameters()).device
+                    if hidden_states.device != lprm_device:
+                        hidden_states = hidden_states.to(lprm_device)
                     lprm_loss = self._compute_lprm_loss(logits, labels, hidden_states)
                     loss = loss + (self.config.lprm_weight * lprm_loss)
                     total_lprm_loss += lprm_loss.item()

@@ -43,6 +43,7 @@ class Mamba3MixerAdapter(nn.Module):
         dtype: Optional[torch.dtype] = None,
         orig_mixer: Optional[nn.Module] = None,
         gradient_checkpointing: bool = False,
+        cpu_offload_in_proj: bool = False,
     ) -> None:
         super().__init__()
 
@@ -90,6 +91,7 @@ class Mamba3MixerAdapter(nn.Module):
             dtype=dtype,
             precomputed_projections=True,
             gradient_checkpointing=gradient_checkpointing,
+            cpu_offload_in_proj=cpu_offload_in_proj,
         )
 
     def forward(
@@ -181,6 +183,15 @@ class Mamba3MixerAdapter(nn.Module):
         )
 
 
+def _detect_layer_device(mixer: nn.Module) -> torch.device:
+    """Return the device of the first parameter in *mixer*."""
+    for p in mixer.parameters():
+        return p.device
+    for b in mixer.buffers():
+        return b.device
+    return torch.device("cpu")
+
+
 def patch_mamba2_with_mamba3(
     model: nn.Module,
     d_state: int = 64,
@@ -189,6 +200,7 @@ def patch_mamba2_with_mamba3(
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
     gradient_checkpointing: bool = False,
+    cpu_offload_in_proj: Optional[bool] = None,
 ) -> int:
     """Replace every ``MambaBlock.mixer`` with ``Mamba3MixerAdapter``.
 
@@ -198,14 +210,21 @@ def patch_mamba2_with_mamba3(
     and out_proj are copied from the original mixer.  The
     ``ComplexMIMOMamba3`` inside the adapter is freshly initialised.
 
+    When *device* is ``None`` (recommended for ``device_map="auto"``),
+    each adapter is created on the same CUDA device as its original
+    mixer, enabling correct multi-GPU placement.
+
     Args:
         model: A HuggingFace ``MambaForCausalLM`` or any module that
                contains ``MambaBlock`` submodules.
         d_state: SSM state dimension for ComplexMIMOMamba3.
         headdim: Head dimension for ComplexMIMOMamba3.
         mimo_rank: Number of parallel MIMO branches.
-        device: Target device.
+        device: Target device.  ``None`` means auto-detect per layer.
         dtype: Target dtype.
+        gradient_checkpointing: Enable gradient checkpointing for scan.
+        cpu_offload_in_proj: Force CPU offload for frozen in_proj.
+            ``None`` = auto (offload when per-GPU VRAM < 18 GB).
 
     Returns:
         Number of mixers patched.
@@ -214,7 +233,16 @@ def patch_mamba2_with_mamba3(
         RuntimeError: If a ``MambaBlock`` is found but its ``.mixer``
             is missing or of an unexpected type.
     """
+    from loguru import logger
+
     count: int = 0
+
+    # Auto-decide CPU offload once
+    if cpu_offload_in_proj is None and torch.cuda.is_available():
+        per_gpu_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        cpu_offload_in_proj = per_gpu_gb < 18.0
+    elif cpu_offload_in_proj is None:
+        cpu_offload_in_proj = True
 
     for _name, child in model.named_modules():
         if not isinstance(child, MambaBlock):
@@ -233,15 +261,23 @@ def patch_mamba2_with_mamba3(
         config: MambaConfig = orig_mixer.config
         layer_idx: int = orig_mixer.layer_idx
 
+        # Auto-detect this layer's device (critical for device_map="auto")
+        layer_device: torch.device = _detect_layer_device(orig_mixer) if device is None else device
+
         adapter = Mamba3MixerAdapter(
             config, layer_idx,
             d_state=d_state, headdim=headdim, mimo_rank=mimo_rank,
-            device=device, dtype=dtype,
+            device=layer_device, dtype=dtype,
             orig_mixer=orig_mixer,
             gradient_checkpointing=gradient_checkpointing,
+            cpu_offload_in_proj=cpu_offload_in_proj,
         )
 
         child.mixer = adapter
         count += 1
+
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            logger.info(f"  [patch] layer {layer_idx}: device={layer_device} allocated={alloc:.2f}GB")
 
     return count
