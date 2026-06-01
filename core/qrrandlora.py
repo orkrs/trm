@@ -409,16 +409,22 @@ def apply_qrandlora(
     count: int = 0
     for name, child in list(model.named_children()):
         full_name: str = f"{_prefix}.{name}" if _prefix else name
-        
-        is_linear = isinstance(child, nn.Linear)
-        is_bnb_linear = False
-        if not is_linear:
-            classname = child.__class__.__name__
-            if classname in ("Linear4bit", "Linear8bitLt", "LinearParams4bit"):
-                is_bnb_linear = True
+
+        # Check for bitsandbytes quantized layers FIRST (they are nn.Linear subclasses).
+        classname = child.__class__.__name__
+        is_bnb_linear = classname in ("Linear4bit", "Linear8bitLt", "LinearParams4bit")
+        is_linear = isinstance(child, nn.Linear) and not is_bnb_linear
 
         if (is_linear or is_bnb_linear) and any(t in name for t in target_modules):
-            if is_linear:
+            if is_bnb_linear:
+                wrapper = QRandLoRALinear4bit(
+                    base_layer=child,
+                    num_components=num_components,
+                    lora_dim=r,
+                    sparsity=sparsity,
+                    alpha=alpha,
+                )
+            else:
                 device: torch.device = child.weight.device
                 dtype: torch.dtype = child.weight.dtype
                 wrapper = QRandLoRALinear(
@@ -430,14 +436,6 @@ def apply_qrandlora(
                     alpha=alpha,
                     device=device,
                     dtype=dtype,
-                )
-            else:
-                wrapper = QRandLoRALinear4bit(
-                    base_layer=child,
-                    num_components=num_components,
-                    lora_dim=r,
-                    sparsity=sparsity,
-                    alpha=alpha,
                 )
             setattr(model, name, wrapper)
             logger.info(
