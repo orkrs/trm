@@ -1072,11 +1072,14 @@ class TRMBankModel(nn.Module):
 
         # Tie lm_head to embeddings if missing from checkpoint.
         # Mamba checkpoints do not include lm_head weights.
+        # Copy weights instead of tying to avoid device mismatch with
+        # device_map="auto" where lm_head and embeddings may be on different GPUs.
         if hasattr(model, "lm_head") and hasattr(model, "backbone"):
             emb = getattr(model.backbone, "embeddings", None)
             if emb is not None:
-                model.lm_head.weight = emb.weight
-                logger.info("lm_head.weight tied to backbone.embeddings.weight")
+                with torch.no_grad():
+                    model.lm_head.weight.copy_(emb.weight.data.to(model.lm_head.weight.dtype))
+                logger.info("lm_head.weight copied from backbone.embeddings.weight")
 
         self.backbone = model
         self._log_mem("after_tie")
