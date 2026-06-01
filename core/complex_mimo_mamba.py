@@ -1047,7 +1047,7 @@ class TRMBankModel(nn.Module):
                     self.pretrained_name,
                     quantization_config=quantization_config,
                     device_map=None,
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     trust_remote_code=True,
                 )
             else:
@@ -1055,14 +1055,14 @@ class TRMBankModel(nn.Module):
                     self.pretrained_name,
                     quantization_config=quantization_config,
                     device_map="auto",
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     trust_remote_code=True,
                 )
         else:
             model = transformers.AutoModelForCausalLM.from_pretrained(
                 self.pretrained_name,
                 device_map=None,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 trust_remote_code=True,
             )
             if self._device is not None:
