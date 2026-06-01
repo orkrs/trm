@@ -442,7 +442,7 @@ def apply_qrandlora(
                     lora_dim=r,
                     sparsity=sparsity,
                     alpha=alpha,
-                    device=device,
+                    device=target_device,
                     dtype=dtype,
                 )
                 wrapper = wrapper.to(target_device)
