@@ -337,6 +337,7 @@ class ComplexMIMOMamba3(nn.Module):
         mimo_rank: int = 2,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        precomputed_projections: bool = False,
     ) -> None:
         super().__init__()
 
@@ -347,6 +348,7 @@ class ComplexMIMOMamba3(nn.Module):
         self.d_state: int = d_state
         self.headdim: int = headdim
         self.mimo_rank: int = mimo_rank
+        self.precomputed_projections: bool = precomputed_projections
 
         # SSM dimension = d_model (no expand factor for direct Mamba-3 style)
         d_in: int = d_model
@@ -354,14 +356,21 @@ class ComplexMIMOMamba3(nn.Module):
 
         factory = {"device": device, "dtype": dtype}
 
-        # ---- in_proj: d_model -> [z(d_in), x(d_in), B, C, dt, A, trap, angles] ----
-        # z + x + (d_state * nheads * mimo_rank) * 2 + nheads * 3 + (d_state//2) * nheads
-        in_total: int = (
-            d_in * 2
-            + d_state * nheads * mimo_rank * 2
-            + nheads * 3
-            + (d_state // 2) * nheads
-        )
+        # ---- in_proj: d_model -> [B, C, dt, A, trap, angles] (and maybe z, x) ----
+        if not precomputed_projections:
+            in_total: int = (
+                d_in * 2
+                + d_state * nheads * mimo_rank * 2
+                + nheads * 3
+                + (d_state // 2) * nheads
+            )
+        else:
+            in_total: int = (
+                d_state * nheads * mimo_rank * 2
+                + nheads * 3
+                + (d_state // 2) * nheads
+            )
+
         self.in_proj = nn.Linear(d_model, in_total, **factory)
 
         # Per-head learned parameters
@@ -378,15 +387,17 @@ class ComplexMIMOMamba3(nn.Module):
         self.B_norm = nn.LayerNorm(d_state, **factory)
         self.C_norm = nn.LayerNorm(d_state, **factory)
 
-        # Output projection + norm
-        self.out_proj = nn.Linear(d_in, d_model, **factory)
-        self.norm = nn.LayerNorm(d_model, **factory)
+        # Output projection + norm (only needed if not precomputed_projections)
+        if not precomputed_projections:
+            self.out_proj = nn.Linear(d_in, d_model, **factory)
+            self.norm = nn.LayerNorm(d_model, **factory)
 
     def forward(
         self,
         x: torch.Tensor,
         state: Optional[torch.Tensor] = None,
         return_branches: bool = False,
+        gate: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Apply ComplexMIMOMamba3 block.
 
@@ -394,6 +405,7 @@ class ComplexMIMOMamba3(nn.Module):
             x: Input of shape (B, L, D) where D = d_model.
             state: Optional initial state (B, D, d_state).
             return_branches: If True, keep per-branch outputs.
+            gate: Optional precomputed gate z of shape (B, L, D).
 
         Returns:
             Tuple (output, final_state, branches_or_None):
@@ -416,10 +428,17 @@ class ComplexMIMOMamba3(nn.Module):
         # proj: (B, L, total)
 
         off: int = 0
-        z = proj[:, :, off:off + D]
-        off += D
-        x_ssm = proj[:, :, off:off + D]
-        off += D
+        if not self.precomputed_projections:
+            z = proj[:, :, off:off + D]
+            off += D
+            x_ssm = proj[:, :, off:off + D]
+            off += D
+        else:
+            x_ssm = x
+            if gate is not None:
+                z = gate
+            else:
+                z = torch.ones_like(x_ssm)
 
         # B: (B, L, H, N, R)
         B_raw = proj[:, :, off:off + N * H * R]
@@ -549,8 +568,9 @@ class ComplexMIMOMamba3(nn.Module):
             y_t = y_t + D_exp.unsqueeze(-1) * x_t.unsqueeze(-1)
 
             # Gate with z: y *= SiLU(z)  (broadcast z over branches)
-            z_t = z[:, t_idx, :]                     # (B, D)
-            y_t = y_t * F.silu(z_t).unsqueeze(-1)
+            if not self.precomputed_projections:
+                z_t = z[:, t_idx, :]                     # (B, D)
+                y_t = y_t * F.silu(z_t).unsqueeze(-1)
             # y_t: (B, D, R)
 
             outputs_list.append(y_t)
@@ -563,6 +583,9 @@ class ComplexMIMOMamba3(nn.Module):
         # Default branch combination: average over R
         y_combined = y.mean(dim=-1)
         # y_combined: (B, L, D)
+
+        if self.precomputed_projections:
+            return y_combined, h.detach(), branches_out
 
         # out_proj: D -> d_model
         out = self.out_proj(y_combined)
@@ -977,17 +1000,20 @@ class TRMBankModel(nn.Module):
         return model
 
     def _freeze_backbone(self) -> None:
-        """Freeze all backbone parameters."""
-        for param in self.backbone.parameters():
-            param.requires_grad = False
+        """Freeze all backbone parameters except trainable adapters."""
+        for name, param in self.backbone.named_parameters():
+            if any(k in name for k in ("Lambda", "Gamma", "mimo_o", "A_log", "dt_bias", "D")):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     @torch.no_grad()
     def build(self) -> None:
         """Load the pretrained backbone and replace all SSM mixers.
 
-        Loads Mamba-1.4B in 4-bit NF4, freezes backbone weights,
-        then replaces every ``MambaBlock.mixer`` with
-        ``Mamba3MixerAdapter`` (which wraps ``ComplexMIMOMamba3``).
+        Loads Mamba-1.4B in 4-bit NF4, then replaces every ``MambaBlock.mixer``
+        with ``Mamba3MixerAdapter`` (which wraps ``ComplexMIMOMamba3``), applies
+        QRandLoRA, and freezes backbone weights.
 
         Call this once before forward() or generate().
         """
@@ -1004,7 +1030,6 @@ class TRMBankModel(nn.Module):
                 logger.info("lm_head.weight tied to backbone.embeddings.weight")
 
         self.backbone = model
-        self._freeze_backbone()
 
         config = model.config
         self.hidden_dim = getattr(config, "hidden_size", 2560)
@@ -1020,6 +1045,9 @@ class TRMBankModel(nn.Module):
         )
 
         self._qr_patched_count = self._apply_qrandlora()
+
+        # Freeze the backbone parameters, keeping only the adapter parameters trainable
+        self._freeze_backbone()
 
         # 4-bit models are already on the correct device via device_map="auto".
         # Only move non-quantized models explicitly.

@@ -98,21 +98,21 @@ class QRandLoRALayer(nn.Module):
             self.out_features,
         )
         num_nonzero = max(1, int(r * d_in * self.sparsity))
-        mask = torch.zeros(n, r, d_in)
+        mask = torch.zeros(n, r, d_in, dtype=torch.int8)
         for i in range(n):
             idx = torch.randperm(r * d_in)[:num_nonzero]
-            mask.view(n, -1)[i, idx] = 1.0
-        signs = torch.where(torch.rand(n, r, d_in) > 0.5, 1.0, -1.0)
-        A = (mask * signs).to(torch.int8)
+            mask.view(n, -1)[i, idx] = 1
+        signs = torch.where(torch.rand(n, r, d_in) > 0.5, torch.tensor(1, dtype=torch.int8), torch.tensor(-1, dtype=torch.int8))
+        A = mask * signs
 
         # B: (n, d_out, r)
         num_nonzero_b = max(1, int(d_out * r * self.sparsity))
-        mask_b = torch.zeros(n, d_out, r)
+        mask_b = torch.zeros(n, d_out, r, dtype=torch.int8)
         for i in range(n):
             idx = torch.randperm(d_out * r)[:num_nonzero_b]
-            mask_b.view(n, -1)[i, idx] = 1.0
-        signs_b = torch.where(torch.rand(n, d_out, r) > 0.5, 1.0, -1.0)
-        B = (mask_b * signs_b).to(torch.int8)
+            mask_b.view(n, -1)[i, idx] = 1
+        signs_b = torch.where(torch.rand(n, d_out, r) > 0.5, torch.tensor(1, dtype=torch.int8), torch.tensor(-1, dtype=torch.int8))
+        B = mask_b * signs_b
 
         return A, B
 
@@ -292,6 +292,71 @@ class QRandLoRALinear(nn.Module):
         return out
 
 
+class QRandLoRALinear4bit(nn.Module):
+    """Linear layer wrapped with QRandLoRA for 4-bit quantized modules.
+
+    Applies the original quantized linear layer and adds the QRandLoRA
+    adaptation on top: y = base_layer(x) + alpha * Delta_W x.
+
+    Args:
+        base_layer: Quantized layer to wrap (e.g. bitsandbytes Linear4bit).
+        num_components: Number of QRandLoRA components.
+        lora_dim: Inner dimension of each low-rank component.
+        sparsity: Fraction of non-zero entries in ternary matrices.
+        alpha: Scaling factor for the LoRA additive update.
+    """
+
+    def __init__(
+        self,
+        base_layer: nn.Module,
+        num_components: int = 8,
+        lora_dim: int = 64,
+        sparsity: float = 0.1,
+        alpha: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.alpha: float = alpha
+
+        device = base_layer.weight.device
+        dtype = getattr(base_layer, "compute_dtype", torch.bfloat16)
+
+        self.qrandlora = QRandLoRALayer(
+            in_features=base_layer.in_features,
+            out_features=base_layer.out_features,
+            num_components=num_components,
+            lora_dim=lora_dim,
+            sparsity=sparsity,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: base quantized forward + alpha * QRandLoRA update.
+
+        Args:
+            x: Input tensor of shape (..., in_features).
+
+        Returns:
+            Output tensor of shape (..., out_features).
+        """
+        y = self.base_layer(x)
+        lora_out = self._apply_lora(x)
+        return y + self.alpha * lora_out
+
+    def _apply_lora(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply QRandLoRA adaptation to input."""
+        A = self.qrandlora.A_frozen.to(x.dtype)     # (n, r, d_in)
+        B = self.qrandlora.B_frozen.to(x.dtype)     # (n, d_out, r)
+        L = self.qrandlora.Lambda                    # (n, r)
+        G = self.qrandlora.Gamma                     # (n, r)
+
+        h = torch.einsum("n r i, ... i -> ... n r", A, x)
+        h = h * L * G
+        out = torch.einsum("n d r, ... n r -> ... d", B, h)
+        return out
+
+
 @torch.no_grad()
 def apply_qrandlora(
     model: nn.Module,
@@ -320,29 +385,50 @@ def apply_qrandlora(
     Returns:
         Number of layers patched.
     """
+    import gc
     count: int = 0
     for name, child in list(model.named_children()):
         full_name: str = f"{_prefix}.{name}" if _prefix else name
-        if isinstance(child, nn.Linear) and any(t in name for t in target_modules):
-            device: torch.device = child.weight.device
-            dtype: torch.dtype = child.weight.dtype
-            wrapper = QRandLoRALinear(
-                base_weight=child.weight.data,
-                base_bias=child.bias.data if child.bias is not None else None,
-                num_components=num_components,
-                lora_dim=r,
-                sparsity=sparsity,
-                alpha=alpha,
-                device=device,
-                dtype=dtype,
-            )
+        
+        is_linear = isinstance(child, nn.Linear)
+        is_bnb_linear = False
+        if not is_linear:
+            classname = child.__class__.__name__
+            if classname in ("Linear4bit", "Linear8bitLt", "LinearParams4bit"):
+                is_bnb_linear = True
+
+        if (is_linear or is_bnb_linear) and any(t in name for t in target_modules):
+            if is_linear:
+                device: torch.device = child.weight.device
+                dtype: torch.dtype = child.weight.dtype
+                wrapper = QRandLoRALinear(
+                    base_weight=child.weight.data,
+                    base_bias=child.bias.data if child.bias is not None else None,
+                    num_components=num_components,
+                    lora_dim=r,
+                    sparsity=sparsity,
+                    alpha=alpha,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                wrapper = QRandLoRALinear4bit(
+                    base_layer=child,
+                    num_components=num_components,
+                    lora_dim=r,
+                    sparsity=sparsity,
+                    alpha=alpha,
+                )
             setattr(model, name, wrapper)
             logger.info(
                 f"QRandLoRA applied: {full_name} "
-                f"({child.weight.shape[1]}->{child.weight.shape[0]}, "
-                f"r={r}, components={num_components}, sparsity={sparsity})"
+                f"({child.in_features}->{child.out_features}, "
+                f"r={r}, components={num_components}, sparsity={sparsity}, "
+                f"type={'bnb' if is_bnb_linear else 'standard'})"
             )
             count += 1
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
             count += apply_qrandlora(
                 child,

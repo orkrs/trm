@@ -41,6 +41,7 @@ class Mamba3MixerAdapter(nn.Module):
         mimo_rank: int = 2,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        orig_mixer: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
 
@@ -57,22 +58,26 @@ class Mamba3MixerAdapter(nn.Module):
         factory = {"device": device, "dtype": dtype}
 
         # ---- Preservation of Mamba conv1d + projections ----
-        self.conv1d = nn.Conv1d(
-            in_channels=self.intermediate_size,
-            out_channels=self.intermediate_size,
-            bias=config.use_conv_bias,
-            kernel_size=config.conv_kernel,
-            groups=self.intermediate_size,
-            padding=config.conv_kernel - 1,
-            **factory,
-        )
-
-        self.in_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size * 2, bias=config.use_bias, **factory
-        )
-        self.out_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=config.use_bias, **factory
-        )
+        if orig_mixer is not None:
+            self.conv1d = orig_mixer.conv1d
+            self.in_proj = orig_mixer.in_proj
+            self.out_proj = orig_mixer.out_proj
+        else:
+            self.conv1d = nn.Conv1d(
+                in_channels=self.intermediate_size,
+                out_channels=self.intermediate_size,
+                bias=config.use_conv_bias,
+                kernel_size=config.conv_kernel,
+                groups=self.intermediate_size,
+                padding=config.conv_kernel - 1,
+                **factory,
+            )
+            self.in_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size * 2, bias=config.use_bias, **factory
+            )
+            self.out_proj = nn.Linear(
+                self.intermediate_size, self.hidden_size, bias=config.use_bias, **factory
+            )
 
         # Our custom SSM core -- replaces the selective scan
         self.ssm = ComplexMIMOMamba3(
@@ -82,6 +87,7 @@ class Mamba3MixerAdapter(nn.Module):
             mimo_rank=mimo_rank,
             device=device,
             dtype=dtype,
+            precomputed_projections=True,
         )
 
     def forward(
@@ -142,18 +148,18 @@ class Mamba3MixerAdapter(nn.Module):
         # 3. SSM: ComplexMIMOMamba3
         # hidden_states: (B, intermediate_size, L) -> (B, L, intermediate_size)
         ssm_in = hidden_states.transpose(1, 2).contiguous()
+        gate_t = gate.transpose(1, 2).contiguous()
 
         state: Optional[torch.Tensor] = None
         if cache_params is not None and cache_params.has_previous_state(self.layer_idx):
             state = cache_params.layers[self.layer_idx].recurrent_states
             # state: (B, intermediate_size, d_state) matches ComplexMIMOMamba3 format
 
-        ssm_out, next_state, _ = self.ssm(ssm_in, state=state)
+        ssm_out, next_state, _ = self.ssm(ssm_in, state=state, gate=gate_t)
         # ssm_out: (B, L, intermediate_size)
 
         # 4. Gate
-        gate_t = gate.transpose(1, 2)
-        # gate_t: (B, L, intermediate_size)
+        # ssm_out is gated using gate_t
         ssm_out = ssm_out * F.silu(gate_t)
 
         # 5. Output projection
@@ -228,16 +234,8 @@ def patch_mamba2_with_mamba3(
             config, layer_idx,
             d_state=d_state, headdim=headdim, mimo_rank=mimo_rank,
             device=device, dtype=dtype,
+            orig_mixer=orig_mixer,
         )
-
-        # Reference original modules directly instead of copying.
-        # With 4-bit quantization, weights are stored as flat Params4bit
-        # tensors, so .copy_() fails with shape mismatch.  By referencing
-        # the original modules we avoid duplicating VRAM and guarantee
-        # compatibility with quantized weights.
-        adapter.conv1d = orig_mixer.conv1d
-        adapter.in_proj = orig_mixer.in_proj
-        adapter.out_proj = orig_mixer.out_proj
 
         child.mixer = adapter
         count += 1
