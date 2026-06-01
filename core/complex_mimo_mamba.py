@@ -1212,8 +1212,13 @@ class TRMBankModel(nn.Module):
             return_dict=True,
         )
 
+        logits = outputs.logits
+        # Guard against NaN/Inf from Mamba slow_forward numerical instability.
+        if logits is not None and (logits.isnan().any() or logits.isinf().any()):
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
         result: Dict[str, Any] = {
-            "logits": outputs.logits,
+            "logits": logits,
             "hidden_states": outputs.hidden_states,
         }
         return result
