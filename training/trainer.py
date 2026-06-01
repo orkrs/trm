@@ -81,8 +81,8 @@ class TruncatedBPTTDataset(IterableDataset):
                 if chunk.numel() < 2:
                     continue
                 yield {
-                    "input_ids": chunk.unsqueeze(0),
-                    "labels": chunk.unsqueeze(0),
+                    "input_ids": chunk,
+                    "labels": chunk,
                     "is_last": torch.tensor(end >= len(seq), dtype=torch.bool),
                 }
 
@@ -365,7 +365,7 @@ class TRMBankTrainer:
 
         dataloader = DataLoader(
             self.train_dataset,
-            batch_size=None,
+            batch_size=1,
             num_workers=0,
         )
 
