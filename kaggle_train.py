@@ -280,9 +280,12 @@ def build_trainer_for_stage(
 
 def main() -> None:
     from accelerate import Accelerator, DataLoaderConfiguration
+    from accelerate import DistributedDataParallelKwargs
 
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
+        kwargs_handlers=[ddp_kwargs],
     )
 
     accelerator.print("=" * 60)

@@ -482,6 +482,14 @@ class ComplexMIMOMamba3(nn.Module):
             C_t_exp = rearrange(C_t_exp, "b g h r n -> b (g h) r n")
             y_t = torch.einsum("b d r n, b d n -> b d r", C_t_exp.float(), h).to(x_ssm.dtype)
 
+            # Apply per-head per-branch MIMO output scaling mimo_o: (H, R, P)
+            # y_t: (B, D, R) -> reshape to (B, H, G, R) -> scale -> back to (B, D, R)
+            mimo_o_exp = self.mimo_o[:, :R, :P]         # (H, R, P)
+            mimo_o_exp = mimo_o_exp.unsqueeze(0)         # (1, H, R, P)
+            y_t_reshaped = rearrange(y_t, "b (h g) r -> b h g r", h=H, g=G)
+            y_t_reshaped = y_t_reshaped * mimo_o_exp.mean(dim=-1, keepdim=True)  # (B, H, G, R) * (1, H, 1, R)
+            y_t = rearrange(y_t_reshaped, "b h g r -> b (h g) r")
+
             D_exp = D_head.unsqueeze(0).unsqueeze(1).expand(-1, G, -1)
             D_exp = rearrange(D_exp, "b g h -> b (g h)")
             y_t = y_t + D_exp.unsqueeze(-1) * x_t.unsqueeze(-1)
