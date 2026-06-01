@@ -99,6 +99,7 @@ class Mamba3MixerAdapter(nn.Module):
         hidden_states: torch.Tensor,
         cache_params: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Forward through conv1d, then ComplexMIMOMamba3 SSM.
 
