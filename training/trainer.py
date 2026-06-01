@@ -215,7 +215,8 @@ class TRMBankTrainer:
         p_correct = probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)  # (B, L)
         target = p_correct.unsqueeze(-1)                                 # (B, L, 1)
 
-        q_pred = self.lprm(hidden_states)                               # (B, L, M)
+        lprm_device = next(self.lprm.parameters()).device
+        q_pred = self.lprm(hidden_states.to(lprm_device))               # (B, L, M)
         if target.device != q_pred.device:
             target = target.to(q_pred.device)
         loss = F.mse_loss(q_pred, target.expand_as(q_pred))
