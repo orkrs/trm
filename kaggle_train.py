@@ -33,11 +33,11 @@ from loguru import logger
 
 STAGE1_OVERRIDES: Dict[str, Any] = {
     "batch_size": 1,
-    "gradient_accumulation_steps": 8,
+    "gradient_accumulation_steps": 4,
     "truncation_length": 128,
     "learning_rate": 3e-4,
     "warmup_steps": 30,
-    "max_steps": 500,
+    "max_steps": 200,
     "num_epochs": 999,
     "log_every_n_steps": 10,
     "eval_every_n_steps": 250,
