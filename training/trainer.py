@@ -83,8 +83,8 @@ class TruncatedBPTTDataset(IterableDataset):
                 yield {
                     "input_ids": chunk.unsqueeze(0),
                     "labels": chunk.unsqueeze(0),
-                    "segment_start": start,
-                    "is_last": end >= len(seq),
+                    "segment_start": torch.tensor(start, dtype=torch.long),
+                    "is_last": torch.tensor(end >= len(seq), dtype=torch.bool),
                 }
 
     def __len__(self) -> int:
@@ -380,7 +380,7 @@ class TRMBankTrainer:
         for batch in pbar:
             input_ids = batch["input_ids"]             # (1, L_chunk)
             labels = batch["labels"]                   # (1, L_chunk)
-            is_last = batch["is_last"]
+            is_last = batch["is_last"].item() if torch.is_tensor(batch["is_last"]) else batch["is_last"]
 
             # With accelerate, tensors are already on the correct device.
             # Without accelerate, move to model's first parameter device.
