@@ -973,6 +973,7 @@ class TRMBankModel(nn.Module):
         qrandlora_num_components: int = 8,
         qrandlora_target_modules: Optional[Tuple[str, ...]] = None,
         cpu_offload_in_proj: Optional[bool] = None,
+        gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -982,6 +983,7 @@ class TRMBankModel(nn.Module):
         self.use_4bit: bool = use_4bit
         self._device: Optional[torch.device] = device
         self._cpu_offload_in_proj: Optional[bool] = cpu_offload_in_proj
+        self._gradient_checkpointing: bool = gradient_checkpointing
 
         self._qrandlora_r: int = qrandlora_r
         self._qrandlora_alpha: float = qrandlora_alpha
@@ -1125,7 +1127,7 @@ class TRMBankModel(nn.Module):
             mimo_rank=self.mimo_rank,
             device=self._device,
             dtype=torch.bfloat16,
-            gradient_checkpointing=True,
+            gradient_checkpointing=self._gradient_checkpointing,
             cpu_offload_in_proj=self._cpu_offload_in_proj,
         )
         self._log_mem("after_patch")

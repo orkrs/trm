@@ -30,12 +30,12 @@ from loguru import logger
 # ------------------------------------------------------------------
 
 STAGE1_OVERRIDES: Dict[str, Any] = {
-    "batch_size": 1,
-    "gradient_accumulation_steps": 4,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 1,
     "truncation_length": 128,
     "learning_rate": 3e-4,
     "warmup_steps": 30,
-    "max_steps": 200,
+    "max_steps": 5000,
     "num_epochs": 999,
     "log_every_n_steps": 10,
     "eval_every_n_steps": 250,
@@ -43,13 +43,13 @@ STAGE1_OVERRIDES: Dict[str, Any] = {
     "output_dir": "./outputs_kaggle",
     "max_seq_length": 1024,
     "lprm_weight": 0.1,
-    "gradient_checkpointing": True,
+    "gradient_checkpointing": False,
 }
 
 STAGE2_OVERRIDES: Dict[str, Any] = {
     **STAGE1_OVERRIDES,
     "learning_rate": 1e-4,
-    "max_steps": 300,
+    "max_steps": 3000,
     "warmup_steps": 20,
 }
 
@@ -205,6 +205,7 @@ def build_trainer_for_stage(
         qrandlora_sparsity=CONFIG.qrandlora.sparsity,
         qrandlora_num_components=CONFIG.qrandlora.num_components,
         qrandlora_target_modules=CONFIG.qrandlora.target_modules,
+        gradient_checkpointing=cfg.gradient_checkpointing,
     )
     model.build()
     model.train()
