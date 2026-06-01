@@ -526,7 +526,15 @@ class ComplexMIMOMamba3(nn.Module):
         # ---- 1. in_proj and split (with CPU offload support) ----
         if self._in_proj_cpu_offload:
             # in_proj.weight is on CPU (frozen); move input to CPU, compute, result back to GPU
-            proj = self.in_proj(x.to(device="cpu")).to(device=device, dtype=dtpe)
+            x_cpu = x.to(device="cpu")
+            # Detect weight dtype (handles both nn.Linear and QRandLoRALinear)
+            if hasattr(self.in_proj, "weight"):
+                w_dtype = self.in_proj.weight.dtype
+            elif hasattr(self.in_proj, "base_weight"):
+                w_dtype = self.in_proj.base_weight.dtype
+            else:
+                w_dtype = x.dtype
+            proj = self.in_proj(x_cpu.to(dtype=w_dtype)).to(device=device, dtype=dtpe)
         else:
             proj = self.in_proj(x)
         # proj: (B, L, total)
