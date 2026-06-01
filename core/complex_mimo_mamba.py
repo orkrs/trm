@@ -429,7 +429,7 @@ class ComplexMIMOMamba3(nn.Module):
         R: int,
         H: int,
         G: int,
-        headdim: int,
+        P: int,
         precomputed: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, D = x_ssm.shape

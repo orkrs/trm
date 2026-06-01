@@ -186,8 +186,8 @@ def build_trainer_for_stage(
         data=sequences,
         truncation_length=cfg.truncation_length,
         seq_length=cfg.max_seq_length,
-        rank=accelerator.process_index,
-        world_size=accelerator.num_processes,
+        rank=0,
+        world_size=1,
     )
     accelerator.print(f"  Dataset chunks: {len(train_dataset)}")
 
@@ -200,7 +200,6 @@ def build_trainer_for_stage(
         mimo_rank=CONFIG.mimo.mimo_rank,
         d_state=CONFIG.model.d_state,
         use_4bit=True,
-        device=None,
         qrandlora_r=64,
         qrandlora_alpha=CONFIG.qrandlora.scaling_init,
         qrandlora_sparsity=CONFIG.qrandlora.sparsity,
@@ -280,16 +279,13 @@ def build_trainer_for_stage(
 
 def main() -> None:
     from accelerate import Accelerator, DataLoaderConfiguration
-    from accelerate import DistributedDataParallelKwargs
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
-        kwargs_handlers=[ddp_kwargs],
     )
 
     accelerator.print("=" * 60)
-    accelerator.print("TRM-Bank v3.0 — Kaggle Training (2xT4, DDP via accelerate)")
+    accelerator.print("TRM-Bank v3.0 — Kaggle Training (Single GPU)")
     accelerator.print("=" * 60)
 
     stage1_path = os.path.join(DATA_DIR, "stage1_qrandlora.jsonl")
