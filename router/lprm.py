@@ -89,6 +89,7 @@ class MultiHeadLPRM(nn.Module):
 
         self.module_names: List[str] = module_names
         self.num_modules: int = len(module_names)
+        self.hidden_dim: int = hidden_dim
 
         self.heads = nn.ModuleList(
             [LPRM(hidden_dim, num_heads, dropout) for _ in range(self.num_modules)]
