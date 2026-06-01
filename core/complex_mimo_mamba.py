@@ -424,6 +424,7 @@ class ComplexMIMOMamba3(nn.Module):
         C_proj_vals: torch.Tensor,
         z_vals: torch.Tensor,
         D_head: torch.Tensor,
+        mimo_o: torch.Tensor,
         N: int,
         R: int,
         H: int,
@@ -484,7 +485,7 @@ class ComplexMIMOMamba3(nn.Module):
 
             # Apply per-head per-branch MIMO output scaling mimo_o: (H, R, P)
             # y_t: (B, D, R) -> reshape to (B, H, G, R) -> scale -> back to (B, D, R)
-            mimo_o_exp = self.mimo_o[:, :R, :P]         # (H, R, P)
+            mimo_o_exp = mimo_o[:, :R, :P]              # (H, R, P)
             mimo_o_exp = mimo_o_exp.unsqueeze(0)         # (1, H, R, P)
             y_t_reshaped = rearrange(y_t, "b (h g) r -> b h g r", h=H, g=G)
             y_t_reshaped = y_t_reshaped * mimo_o_exp.mean(dim=-1, keepdim=True)  # (B, H, G, R) * (1, H, 1, R)
@@ -615,14 +616,14 @@ class ComplexMIMOMamba3(nn.Module):
                 self._scan_impl,
                 x_ssm, h, cos_all, sin_all, dt, A, trap, B_proj, C_proj,
                 z if not self.precomputed_projections else z,
-                self.D, N, R, H, G, headdim_actual, self.precomputed_projections,
+                self.D, self.mimo_o, N, R, H, G, headdim_actual, self.precomputed_projections,
                 use_reentrant=False,
             )
         else:
             y, h = self._scan_impl(
                 x_ssm, h, cos_all, sin_all, dt, A, trap, B_proj, C_proj,
                 z if not self.precomputed_projections else z,
-                self.D, N, R, H, G, headdim_actual, self.precomputed_projections,
+                self.D, self.mimo_o, N, R, H, G, headdim_actual, self.precomputed_projections,
             )
         # y: (B, L, D, R)
 
