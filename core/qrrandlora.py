@@ -275,6 +275,11 @@ class QRandLoRALinear(nn.Module):
         """Proxy to base_weight for compatibility."""
         return self.base_weight
 
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        """Proxy to base_bias for compatibility."""
+        return self.base_bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass: base transformation + alpha * QRandLoRA update.
 
@@ -365,6 +370,11 @@ class QRandLoRALinear4bit(nn.Module):
     def weight(self) -> torch.Tensor:
         """Proxy to base_layer.weight for compatibility with Mamba fast path."""
         return self.base_layer.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        """Proxy to base_layer.bias for compatibility with Mamba fast path."""
+        return getattr(self.base_layer, "bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass: base quantized forward + alpha * QRandLoRA update.
