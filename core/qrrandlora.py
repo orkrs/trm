@@ -67,7 +67,11 @@ class QRandLoRALayer(nn.Module):
         # Frozen sparse ternary matrices A_j and B_j for each component.
         # A_j: (num_components, out_features, lora_dim)
         # B_j: (num_components, lora_dim, in_features)
-        A_data, B_data = self._init_ternary_matrices(device=device)
+        # Created on CPU to avoid GPU OOM, then moved to target device.
+        A_data, B_data = self._init_ternary_matrices()
+        if device is not None and device.type == "cuda":
+            A_data = A_data.to(device)
+            B_data = B_data.to(device)
         self.register_buffer("A_frozen", A_data)
         self.register_buffer("B_frozen", B_data)
 
@@ -88,11 +92,14 @@ class QRandLoRALayer(nn.Module):
         Non-zero positions are randomly selected and assigned +1 or -1
         with equal probability.
 
+        Tensors are created on CPU first to avoid GPU OOM, then moved
+        to the target device (caller should handle the move).
+
         Args:
-            device: Target device for the tensors.
+            device: Not used (kept for API compatibility).
 
         Returns:
-            Tuple of (A, B) tensors.
+            Tuple of (A, B) tensors on CPU.
         """
         n, r, d_in, d_out = (
             self.num_components,
@@ -101,28 +108,28 @@ class QRandLoRALayer(nn.Module):
             self.out_features,
         )
         num_nonzero = max(1, int(r * d_in * self.sparsity))
-        mask = torch.zeros(n, r, d_in, dtype=torch.int8, device=device)
+        mask = torch.zeros(n, r, d_in, dtype=torch.int8)
         for i in range(n):
-            idx = torch.randperm(r * d_in, device=device)[:num_nonzero]
+            idx = torch.randperm(r * d_in)[:num_nonzero]
             mask.view(n, -1)[i, idx] = 1
         signs = torch.where(
-            torch.rand(n, r, d_in, device=device) > 0.5,
-            torch.tensor(1, dtype=torch.int8, device=device),
-            torch.tensor(-1, dtype=torch.int8, device=device),
+            torch.rand(n, r, d_in) > 0.5,
+            torch.tensor(1, dtype=torch.int8),
+            torch.tensor(-1, dtype=torch.int8),
         )
         A = mask * signs
         del mask, signs
 
         # B: (n, d_out, r)
         num_nonzero_b = max(1, int(d_out * r * self.sparsity))
-        mask_b = torch.zeros(n, d_out, r, dtype=torch.int8, device=device)
+        mask_b = torch.zeros(n, d_out, r, dtype=torch.int8)
         for i in range(n):
-            idx = torch.randperm(d_out * r, device=device)[:num_nonzero_b]
+            idx = torch.randperm(d_out * r)[:num_nonzero_b]
             mask_b.view(n, -1)[i, idx] = 1
         signs_b = torch.where(
-            torch.rand(n, d_out, r, device=device) > 0.5,
-            torch.tensor(1, dtype=torch.int8, device=device),
-            torch.tensor(-1, dtype=torch.int8, device=device),
+            torch.rand(n, d_out, r) > 0.5,
+            torch.tensor(1, dtype=torch.int8),
+            torch.tensor(-1, dtype=torch.int8),
         )
         B = mask_b * signs_b
         del mask_b, signs_b
