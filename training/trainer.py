@@ -130,6 +130,7 @@ class TRMBankTrainer:
             PagedAdamW is not None
             and torch.cuda.is_available()
             and next(self.model.parameters()).is_cuda
+            and torch.cuda.device_count() == 1
         )
         optim_cls = PagedAdamW if use_paged else torch.optim.AdamW
         self.optimizer = optim_cls(
