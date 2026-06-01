@@ -361,6 +361,10 @@ class TRMBankTrainer:
 
                 # LPRM auxiliary loss (teaches heads to predict model confidence).
                 if self.lprm is not None and hidden_states is not None:
+                    # hidden_states is a tuple of tensors (one per layer).
+                    # Use the last layer's hidden states for LPRM.
+                    if isinstance(hidden_states, (tuple, list)):
+                        hidden_states = hidden_states[-1]
                     # hidden_states may be on a different device than LPRM.
                     lprm_device = next(self.lprm.parameters()).device
                     if hidden_states.device != lprm_device:
