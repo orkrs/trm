@@ -365,11 +365,15 @@ class TRMBankTrainer:
                     # Use the last layer's hidden states for LPRM.
                     if isinstance(hidden_states, (tuple, list)):
                         hidden_states = hidden_states[-1]
-                    # hidden_states may be on a different device than LPRM.
-                    lprm_device = next(self.lprm.parameters()).device
-                    if hidden_states.device != lprm_device:
-                        hidden_states = hidden_states.to(lprm_device)
+                    # Move hidden_states to logits device for loss consistency.
+                    # With device_map="auto", logits may be on cuda:0 (from lm_head)
+                    # while hidden_states is on cuda:1 (from last layer).
+                    if hidden_states.device != logits.device:
+                        hidden_states = hidden_states.to(logits.device)
                     lprm_loss = self._compute_lprm_loss(logits, labels, hidden_states)
+                    # lprm_loss may be on a different device than loss (from LPRM on cuda:1).
+                    if lprm_loss.device != loss.device:
+                        lprm_loss = lprm_loss.to(loss.device)
                     loss = loss + (self.config.lprm_weight * lprm_loss)
                     total_lprm_loss += lprm_loss.item()
 
