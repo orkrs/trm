@@ -32,7 +32,7 @@ from loguru import logger
 # ------------------------------------------------------------------
 
 STAGE1_OVERRIDES: Dict[str, Any] = {
-    "batch_size": 2,
+    "batch_size": 1,
     "gradient_accumulation_steps": 8,
     "truncation_length": 256,
     "learning_rate": 3e-4,
